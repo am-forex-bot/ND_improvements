@@ -49,18 +49,41 @@ Public Sub SendAsCopy()
     Dim displayName As String
     displayName = GetCleanDocName(doc)
 
-    ' Create Outlook email with the file attached
+    ' Get the file extension from the original document
+    Dim fileExt As String
+    Dim extPos As Long: extPos = InStrRev(doc.Name, ".")
+    If extPos > 0 Then
+        fileExt = Mid$(doc.Name, extPos)  ' e.g. ".docx"
+    Else
+        fileExt = ".docx"
+    End If
+
+    ' Copy to temp folder with clean filename (no doc ID in the name)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim tempDir As String: tempDir = PrepareTempFolder()
+    Dim cleanFileName As String
+    cleanFileName = MakeWindowsSafe(displayName) & fileExt
+    Dim tempCopy As String: tempCopy = tempDir & cleanFileName
+    fso.CopyFile doc.FullName, tempCopy, True
+
+    ' Create Outlook email with the clean-named copy attached
     Dim olApp As Object: Set olApp = GetOutlookApp()
-    If olApp Is Nothing Then Exit Sub
+    If olApp Is Nothing Then GoTo CopyCleanup
 
     Dim oMail As Object: Set oMail = olApp.CreateItem(0)  ' olMailItem = 0
     oMail.Subject = displayName
-    oMail.Attachments.Add doc.FullName, 1  ' olByValue = 1
+    oMail.Attachments.Add tempCopy, 1  ' olByValue = 1
     oMail.Display
 
+CopyCleanup:
+    On Error Resume Next
+    Kill tempCopy
+    On Error GoTo 0
     Exit Sub
+
 ErrHandler:
     MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "NetDocs Send"
+    Resume CopyCleanup
 End Sub
 
 ' Opens a new Outlook email with an .html redirect attachment that opens
@@ -113,6 +136,13 @@ Public Sub SendAsLink()
 
     Dim oMail As Object: Set oMail = olApp.CreateItem(0)  ' olMailItem = 0
     oMail.Subject = displayName
+
+    ' Set body BEFORE adding attachment to prevent Outlook rendering
+    ' the .html inline in the message body
+    oMail.BodyFormat = 1  ' olFormatPlain
+    oMail.Body = "Please open the attached file to access this document in NetDocuments." & _
+                 vbCrLf & vbCrLf
+
     oMail.Attachments.Add htmlPath, 1  ' olByValue = 1
     oMail.Display
 
