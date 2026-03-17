@@ -1,423 +1,313 @@
 Attribute VB_Name = "NetDocsLinkConverter"
 '==============================================================================
-' NetDocuments Link-to-Attachment Converter for Outlook
+' NetDocuments Link-to-Attachment Converter for Microsoft Outlook
 '==============================================================================
-' Scans the currently open email for NetDocuments URLs (hyperlinks and raw),
-' creates .url shortcut files, attaches them, and cleans up the email body.
+' PURPOSE:  Scans the active email for NetDocuments URLs, creates .url
+'           shortcut files, attaches them, and strips the links from the body.
+'
+' INSTALL:  Alt+F11 in Outlook → Import File… → select this .bas
+'           -OR- paste into a new Module.
+'
+' RUN:      Open an email → Alt+F8 → ConvertNetDocsLinksToAttachments → Run
+'
+' NOTES:    - .url files are written to %TEMP%\NetDocsLinks\
+'           - That folder MUST be whitelisted via registry/GPO if your org
+'             blocks .url files (see accompanying deployment guide).
+'           - Safe to run multiple times – skips already-attached filenames.
+'           - Does NOT control how Word/Excel open; relies on existing
+'             ndOffice / NetDocuments integration.
 '==============================================================================
 Option Explicit
 
 ' ---------------------------------------------------------------------------
-' ENTRY POINT – run from an open Inspector (compose/read) window
+'  Constants
+' ---------------------------------------------------------------------------
+Private Const NETDOCS_TEMP_FOLDER As String = "NetDocsLinks"
+Private Const SUMMARY_TEXT As String = "Documents attached via NetDocuments"
+
+' ---------------------------------------------------------------------------
+'  ENTRY POINT
 ' ---------------------------------------------------------------------------
 Public Sub ConvertNetDocsLinksToAttachments()
+    On Error GoTo ErrHandler
 
-    ' --- Validate we have an open mail item --------------------------------
-    Dim oInspector As Outlook.Inspector
-    Set oInspector = Application.ActiveInspector
-
-    If oInspector Is Nothing Then
-        MsgBox "Please open an email first.", vbExclamation
+    ' --- 1. Validate: must have an open MailItem in an Inspector -----------
+    Dim oInsp As Outlook.Inspector
+    Set oInsp = Application.ActiveInspector
+    If oInsp Is Nothing Then
+        MsgBox "Please open an email first.", vbExclamation, "NetDocs Converter"
         Exit Sub
     End If
 
-    If Not TypeOf oInspector.CurrentItem Is Outlook.MailItem Then
-        MsgBox "This macro only works on email messages.", vbExclamation
+    If Not TypeOf oInsp.CurrentItem Is Outlook.MailItem Then
+        MsgBox "This macro works only on email messages.", vbExclamation, "NetDocs Converter"
         Exit Sub
     End If
 
     Dim oMail As Outlook.MailItem
-    Set oMail = oInspector.CurrentItem
+    Set oMail = oInsp.CurrentItem
 
-    ' --- Collect links from HTML body --------------------------------------
+    ' --- 2. Parse HTML body for NetDocuments links -------------------------
     Dim htmlBody As String
     htmlBody = oMail.HTMLBody
 
-    Dim links As Collection  ' Each item is an array: Array(url, displayName)
-    Set links = ExtractNetDocsLinks(htmlBody)
+    Dim links As Collection          ' Each item: Array(url, displayText)
+    Set links = CollectNetDocsLinks(htmlBody)
 
     If links.Count = 0 Then
-        MsgBox "No NetDocuments links found in this email.", vbInformation
+        MsgBox "No NetDocuments links found in this email.", vbInformation, "NetDocs Converter"
         Exit Sub
     End If
 
-    ' --- De-duplicate by URL -----------------------------------------------
-    Dim uniqueLinks As Collection
-    Set uniqueLinks = DeduplicateLinks(links)
+    ' --- 3. De-duplicate by URL --------------------------------------------
+    Dim unique As Collection
+    Set unique = DeduplicateByUrl(links)
 
-    ' --- Check existing attachments to avoid duplicates on re-run ----------
-    Dim existingNames As Collection
-    Set existingNames = GetExistingAttachmentNames(oMail)
-
-    ' --- Create .url files and attach --------------------------------------
+    ' --- 4. Prepare temp folder --------------------------------------------
     Dim tempDir As String
-    tempDir = Environ$("TEMP")
-    If Right$(tempDir, 1) <> "\" Then tempDir = tempDir & "\"
+    tempDir = PrepareTempFolder()
 
-    Dim createdFiles As New Collection  ' track paths for cleanup
-    Dim i As Long
-    Dim linkData As Variant
-    Dim url As String
-    Dim displayName As String
-    Dim fileName As String
-    Dim filePath As String
+    ' --- 5. Build existing-attachment set (re-run guard) -------------------
+    Dim attached As Object  ' Scripting.Dictionary
+    Set attached = CreateObject("Scripting.Dictionary")
+    attached.CompareMode = vbTextCompare
+    Dim a As Long
+    For a = 1 To oMail.Attachments.Count
+        attached(oMail.Attachments(a).FileName) = True
+    Next a
+
+    ' --- 6. Create .url files and attach -----------------------------------
+    Dim createdPaths As New Collection
     Dim attachCount As Long
+    Dim i As Long
 
-    For i = 1 To uniqueLinks.Count
-        linkData = uniqueLinks(i)
-        url = CStr(linkData(0))
-        displayName = CStr(linkData(1))
+    For i = 1 To unique.Count
+        Dim entry As Variant: entry = unique(i)
+        Dim sUrl As String:   sUrl = CStr(entry(0))
+        Dim sName As String:  sName = CStr(entry(1))
 
-        ' Build a safe .url filename
-        fileName = BuildUrlFilename(displayName, url)
+        Dim fName As String
+        fName = DetermineFilename(sName, sUrl)
 
-        ' Skip if already attached (re-run protection)
-        If Not CollectionContains(existingNames, LCase$(fileName)) Then
-            filePath = tempDir & fileName
+        ' Skip if already attached (idempotent on re-run)
+        If Not attached.Exists(fName) Then
+            Dim fPath As String
+            fPath = tempDir & fName
 
-            ' Write the .url shortcut
-            WriteUrlFile filePath, url
-            createdFiles.Add filePath
+            WriteUrlShortcut fPath, sUrl
+            createdPaths.Add fPath
 
-            ' Attach to the mail item
-            oMail.Attachments.Add filePath, olByValue
+            oMail.Attachments.Add fPath, olByValue
+            attached(fName) = True
             attachCount = attachCount + 1
         End If
     Next i
 
-    ' --- Clean the HTML body – remove ND links, insert summary line --------
-    Dim cleanedHtml As String
-    cleanedHtml = RemoveNetDocsLinksFromHtml(htmlBody)
+    ' --- 7. Strip NetDocuments links from HTML body ------------------------
+    Dim cleaned As String
+    cleaned = StripNetDocsFromHtml(htmlBody)
+    cleaned = InjectSummaryLine(cleaned, unique.Count)
+    oMail.HTMLBody = cleaned
 
-    ' Insert summary notice (before </body> or at end)
-    cleanedHtml = InsertSummaryLine(cleanedHtml, uniqueLinks.Count)
-
-    oMail.HTMLBody = cleanedHtml
-
-    ' --- Delete temp files -------------------------------------------------
-    Dim f As Variant
-    For Each f In createdFiles
+    ' --- 8. Clean up temp files --------------------------------------------
+    Dim p As Variant
+    For Each p In createdPaths
         On Error Resume Next
-        Kill CStr(f)
+        Kill CStr(p)
         On Error GoTo 0
-    Next f
+    Next p
 
-    ' --- Done --------------------------------------------------------------
-    MsgBox "NetDocuments links converted to attachments", vbInformation
+    ' --- 9. Confirm --------------------------------------------------------
+    MsgBox "NetDocuments links converted to attachments", vbInformation, "NetDocs Converter"
+    Exit Sub
 
+ErrHandler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "NetDocs Converter"
 End Sub
 
 ' ===========================================================================
-' LINK EXTRACTION
+'  LINK COLLECTION
 ' ===========================================================================
 
-' Returns a Collection of Array(url, displayName) for every ND link found.
-Private Function ExtractNetDocsLinks(htmlBody As String) As Collection
-    Dim results As New Collection
+' Scans HTMLBody and returns Collection of Array(url, displayText).
+' Pass 1: <a href="…netdocuments.com…">text</a>
+' Pass 2: raw URLs outside anchors
+Private Function CollectNetDocsLinks(htmlBody As String) As Collection
+    Dim result As New Collection
 
-    ' --- Pass 1: extract <a href="...netdocuments.com...">text</a> ---------
-    Dim regexAnchor As Object
-    Set regexAnchor = CreateObject("VBScript.RegExp")
-    With regexAnchor
-        .Global = True
-        .IgnoreCase = True
-        .MultiLine = True
-        ' Capture href value and inner text
-        .Pattern = "<a\b[^>]*\bhref\s*=\s*[""']([^""']*netdocuments\.com[^""']*)[""'][^>]*>([\s\S]*?)<\/a>"
-    End With
+    ' --- Anchors -----------------------------------------------------------
+    Dim reA As Object: Set reA = NewRegex( _
+        "<a\b[^>]*?\bhref\s*=\s*[""']([^""']*netdocuments\.com[^""']*)[""'][^>]*>([\s\S]*?)<\/a>", _
+        True)
+    Dim mc As Object
+    Dim seenUrls As Object: Set seenUrls = CreateObject("Scripting.Dictionary")
+    seenUrls.CompareMode = vbTextCompare
 
-    Dim matches As Object
-    Dim m As Object
-    Dim anchorUrl As String
-    Dim anchorText As String
-
-    If regexAnchor.Test(htmlBody) Then
-        Set matches = regexAnchor.Execute(htmlBody)
-        For Each m In matches
-            anchorUrl = Trim$(m.SubMatches(0))
-            anchorText = StripHtmlTags(Trim$(m.SubMatches(1)))
-            If Len(anchorUrl) > 0 Then
-                results.Add Array(anchorUrl, anchorText)
-            End If
-        Next m
-    End If
-
-    ' --- Pass 2: find raw URLs NOT already inside an <a> tag ---------------
-    '     We look for URLs that contain netdocuments.com
-    Dim regexRaw As Object
-    Set regexRaw = CreateObject("VBScript.RegExp")
-    With regexRaw
-        .Global = True
-        .IgnoreCase = True
-        .MultiLine = True
-        .Pattern = "(https?://[^\s""'<>]*netdocuments\.com[^\s""'<>]*)"
-    End With
-
-    ' Build set of URLs already captured from anchors
-    Dim anchorUrls As New Collection
-    Dim idx As Long
-    For idx = 1 To results.Count
-        On Error Resume Next
-        anchorUrls.Add "", CStr(results(idx)(0))
-        On Error GoTo 0
-    Next idx
-
-    ' We need to check raw URLs are not inside href="..." (already captured)
-    ' Strategy: strip all <a...>...</a> tags, then search remainder
-    Dim bodyNoAnchors As String
-    bodyNoAnchors = regexAnchor.Replace(htmlBody, " ")
-
-    ' Also strip any remaining href="..." attributes to avoid double-capture
-    Dim regexHref As Object
-    Set regexHref = CreateObject("VBScript.RegExp")
-    With regexHref
-        .Global = True
-        .IgnoreCase = True
-        .Pattern = "href\s*=\s*[""'][^""']*[""']"
-    End With
-    bodyNoAnchors = regexHref.Replace(bodyNoAnchors, " ")
-
-    If regexRaw.Test(bodyNoAnchors) Then
-        Set matches = regexRaw.Execute(bodyNoAnchors)
-        For Each m In matches
-            Dim rawUrl As String
-            rawUrl = Trim$(m.SubMatches(0))
-            ' Skip if we already have this URL from anchor pass
-            Dim alreadyHave As Boolean
-            alreadyHave = False
-            On Error Resume Next
-            Dim dummy As String
-            dummy = anchorUrls(rawUrl)
-            If Err.Number = 0 Then alreadyHave = True
-            Err.Clear
-            On Error GoTo 0
-
-            If Not alreadyHave And Len(rawUrl) > 0 Then
-                results.Add Array(rawUrl, "")
-                On Error Resume Next
-                anchorUrls.Add "", rawUrl
-                On Error GoTo 0
-            End If
-        Next m
-    End If
-
-    Set ExtractNetDocsLinks = results
-End Function
-
-' ===========================================================================
-' FILENAME BUILDING
-' ===========================================================================
-
-' Determines the best filename for the .url shortcut.
-' Priority: 1) hyperlink display text  2) filename from URL  3) doc ID
-Private Function BuildUrlFilename(displayName As String, url As String) As String
-    Dim baseName As String
-
-    ' --- Priority 1: display text from hyperlink ---------------------------
-    If Len(Trim$(displayName)) > 0 Then
-        baseName = Trim$(displayName)
-        ' If display text already has a file extension, strip it (we add .url)
-        ' But keep it in the name for clarity – e.g. "Contract_v5.docx.url"
-        GoTo Sanitize
-    End If
-
-    ' --- Priority 2: try to extract a filename from the URL path -----------
-    baseName = ExtractFilenameFromUrl(url)
-    If Len(baseName) > 0 Then GoTo Sanitize
-
-    ' --- Priority 3: extract document ID from URL --------------------------
-    baseName = ExtractDocIdFromUrl(url)
-    If Len(baseName) > 0 Then
-        baseName = "NetDocs_" & baseName
-        GoTo Sanitize
-    End If
-
-    ' --- Fallback (should rarely happen) -----------------------------------
-    baseName = "NetDocs_Document"
-
-Sanitize:
-    ' Make filename Windows-safe
-    baseName = SanitizeFilename(baseName)
-
-    ' Ensure it ends with .url
-    If LCase$(Right$(baseName, 4)) <> ".url" Then
-        baseName = baseName & ".url"
-    End If
-
-    BuildUrlFilename = baseName
-End Function
-
-' Attempts to pull a filename segment from a NetDocuments URL.
-Private Function ExtractFilenameFromUrl(url As String) As String
-    ' NetDocuments URLs often contain paths like /document/... or query params
-    ' with filenames. Try a few common patterns.
-
-    Dim regexFn As Object
-    Set regexFn = CreateObject("VBScript.RegExp")
-
-    ' Pattern: look for something that looks like a filename with extension
-    ' in the URL path or query string
-    With regexFn
-        .Global = False
-        .IgnoreCase = True
-        .Pattern = "[\/?&=]([A-Za-z0-9_\-\. ]+\.(docx?|xlsx?|pptx?|pdf|txt|csv|rtf|msg))"
-    End With
-
-    If regexFn.Test(url) Then
+    If reA.Test(htmlBody) Then
+        Set mc = reA.Execute(htmlBody)
         Dim m As Object
-        Set m = regexFn.Execute(url)
-        ExtractFilenameFromUrl = m(0).SubMatches(0)
-    Else
-        ExtractFilenameFromUrl = ""
+        For Each m In mc
+            Dim aUrl As String:  aUrl = Trim$(m.SubMatches(0))
+            Dim aText As String: aText = StripTags(Trim$(m.SubMatches(1)))
+            If Len(aUrl) > 0 Then
+                result.Add Array(aUrl, aText)
+                seenUrls(aUrl) = True
+            End If
+        Next m
+    End If
+
+    ' --- Raw URLs (outside anchors) ----------------------------------------
+    ' Remove anchors first so we don't double-count
+    Dim stripped As String: stripped = reA.Replace(htmlBody, " ")
+    ' Also remove any remaining href attrs
+    Dim reH As Object: Set reH = NewRegex("href\s*=\s*[""'][^""']*[""']", True)
+    stripped = reH.Replace(stripped, " ")
+
+    Dim reR As Object: Set reR = NewRegex( _
+        "(https?://[^\s""'<>]*netdocuments\.com[^\s""'<>]*)", True)
+
+    If reR.Test(stripped) Then
+        Set mc = reR.Execute(stripped)
+        For Each m In mc
+            Dim rUrl As String: rUrl = Trim$(m.SubMatches(0))
+            If Len(rUrl) > 0 And Not seenUrls.Exists(rUrl) Then
+                result.Add Array(rUrl, "")
+                seenUrls(rUrl) = True
+            End If
+        Next m
+    End If
+
+    Set CollectNetDocsLinks = result
+End Function
+
+' ===========================================================================
+'  FILENAME DETERMINATION
+' ===========================================================================
+
+' Priority: displayText → filename in URL → docID → fallback
+Private Function DetermineFilename(displayText As String, url As String) As String
+    Dim base As String
+
+    ' Priority 1 – hyperlink display text
+    If Len(Trim$(displayText)) > 0 Then
+        base = Trim$(displayText)
+        GoTo Finish
+    End If
+
+    ' Priority 2 – filename extracted from URL path / query
+    base = FilenameFromUrl(url)
+    If Len(base) > 0 Then GoTo Finish
+
+    ' Priority 3 – document ID
+    Dim docId As String: docId = DocIdFromUrl(url)
+    If Len(docId) > 0 Then
+        base = "NetDocs_" & docId
+        GoTo Finish
+    End If
+
+    ' Fallback
+    base = "NetDocs_Document"
+
+Finish:
+    base = MakeWindowsSafe(base)
+    If LCase$(Right$(base, 4)) <> ".url" Then base = base & ".url"
+    DetermineFilename = base
+End Function
+
+Private Function FilenameFromUrl(url As String) As String
+    Dim re As Object: Set re = NewRegex( _
+        "[\/?&=]([A-Za-z0-9_\-\. ]+\.(docx?|xlsx?|pptx?|pdf|txt|csv|rtf|msg))", False)
+    If re.Test(url) Then
+        FilenameFromUrl = re.Execute(url)(0).SubMatches(0)
     End If
 End Function
 
-' Extracts the NetDocuments document ID from the URL.
-Private Function ExtractDocIdFromUrl(url As String) As String
-    Dim regexId As Object
-    Set regexId = CreateObject("VBScript.RegExp")
-
-    ' Common ND URL patterns:
-    '   /nddocview/.../{docId}
-    '   /document/{docId}
-    '   ndDocId=xxxx
-    '   /d/{docId}
-    '   /{cabId}/{docId}/v{version}
-
-    ' Try multiple patterns in order of specificity
+Private Function DocIdFromUrl(url As String) As String
     Dim patterns As Variant
     patterns = Array( _
         "[?&]ndDocId=([A-Za-z0-9\-]+)", _
         "/nddocview[^/]*/([A-Za-z0-9\-]+)", _
         "/document/([A-Za-z0-9\-]+)", _
         "/d/([A-Za-z0-9\-]+)", _
-        "/([0-9]{4,}[\-/][0-9]+)" _
-    )
+        "/([0-9]{4,}[\-/][0-9]+)")
 
     Dim p As Variant
     For Each p In patterns
-        With regexId
-            .Global = False
-            .IgnoreCase = True
-            .Pattern = CStr(p)
-        End With
-        If regexId.Test(url) Then
-            Dim mx As Object
-            Set mx = regexId.Execute(url)
-            ExtractDocIdFromUrl = mx(0).SubMatches(0)
+        Dim re As Object: Set re = NewRegex(CStr(p), False)
+        If re.Test(url) Then
+            DocIdFromUrl = re.Execute(url)(0).SubMatches(0)
             Exit Function
         End If
     Next p
 
-    ' Last resort: grab the last path segment that looks like an ID
-    Dim regexLast As Object
-    Set regexLast = CreateObject("VBScript.RegExp")
-    With regexLast
-        .Global = True
-        .IgnoreCase = True
-        .Pattern = "/([A-Za-z0-9\-]{6,})"
-    End With
-
-    If regexLast.Test(url) Then
-        Dim allMatches As Object
-        Set allMatches = regexLast.Execute(url)
-        ' Use the last significant path segment
-        ExtractDocIdFromUrl = allMatches(allMatches.Count - 1).SubMatches(0)
-    Else
-        ExtractDocIdFromUrl = ""
+    ' Last-resort: final path segment ≥ 6 chars
+    Dim reL As Object: Set reL = NewRegex("/([A-Za-z0-9\-]{6,})", True)
+    If reL.Test(url) Then
+        Dim mc As Object: Set mc = reL.Execute(url)
+        DocIdFromUrl = mc(mc.Count - 1).SubMatches(0)
     End If
 End Function
 
 ' ===========================================================================
-' HTML CLEANUP
+'  HTML CLEANUP
 ' ===========================================================================
 
-' Removes all NetDocuments links (anchors and raw URLs) from the HTML body.
-Private Function RemoveNetDocsLinksFromHtml(htmlBody As String) As String
-    Dim result As String
-    result = htmlBody
+Private Function StripNetDocsFromHtml(htmlBody As String) As String
+    Dim s As String: s = htmlBody
 
-    ' --- Remove <a> tags pointing to netdocuments.com ----------------------
-    Dim regexA As Object
-    Set regexA = CreateObject("VBScript.RegExp")
-    With regexA
-        .Global = True
-        .IgnoreCase = True
-        .MultiLine = True
-        .Pattern = "<a\b[^>]*\bhref\s*=\s*[""'][^""']*netdocuments\.com[^""']*[""'][^>]*>[\s\S]*?<\/a>"
-    End With
-    result = regexA.Replace(result, "")
+    ' Remove <a> tags with netdocuments.com href
+    Dim reA As Object: Set reA = NewRegex( _
+        "<a\b[^>]*?\bhref\s*=\s*[""'][^""']*netdocuments\.com[^""']*[""'][^>]*>[\s\S]*?<\/a>", True)
+    s = reA.Replace(s, "")
 
-    ' --- Remove raw netdocuments.com URLs ----------------------------------
-    Dim regexRaw As Object
-    Set regexRaw = CreateObject("VBScript.RegExp")
-    With regexRaw
-        .Global = True
-        .IgnoreCase = True
-        .MultiLine = True
-        .Pattern = "https?://[^\s""'<>]*netdocuments\.com[^\s""'<>]*"
-    End With
-    result = regexRaw.Replace(result, "")
+    ' Remove raw URLs
+    Dim reR As Object: Set reR = NewRegex( _
+        "https?://[^\s""'<>]*netdocuments\.com[^\s""'<>]*", True)
+    s = reR.Replace(s, "")
 
-    ' --- Clean up leftover empty paragraphs/divs/list items ----------------
-    '     (only truly empty ones – no visible content)
-    Dim regexEmpty As Object
-    Set regexEmpty = CreateObject("VBScript.RegExp")
-    With regexEmpty
-        .Global = True
-        .IgnoreCase = True
-        .MultiLine = True
-        ' Remove <p>, <div>, <li> that contain only whitespace/&nbsp;/line breaks
-        .Pattern = "<(p|div|li)\b[^>]*>\s*(&nbsp;|\s|<br\s*/?>)*\s*<\/\1>"
-    End With
-    ' Run twice to catch nested empties
-    result = regexEmpty.Replace(result, "")
-    result = regexEmpty.Replace(result, "")
+    ' Collapse empty wrappers left behind
+    Dim reE As Object: Set reE = NewRegex( _
+        "<(p|div|li|span)\b[^>]*>\s*(&nbsp;|\s|<br\s*/?>)*\s*<\/\1>", True)
+    s = reE.Replace(s, "")
+    s = reE.Replace(s, "")   ' second pass for nesting
 
-    RemoveNetDocsLinksFromHtml = result
+    StripNetDocsFromHtml = s
 End Function
 
-' Inserts a summary line into the HTML body.
-Private Function InsertSummaryLine(htmlBody As String, linkCount As Long) As String
-    Dim summaryHtml As String
-    summaryHtml = "<p style=""color:#336699;font-weight:bold;margin:10px 0;"">" & _
-                  "Documents attached via NetDocuments (" & linkCount & " file" & _
-                  IIf(linkCount <> 1, "s", "") & ")</p>"
+Private Function InjectSummaryLine(htmlBody As String, cnt As Long) As String
+    Dim tag As String
+    tag = "<p style=""color:#336699;font-weight:bold;margin:12px 0;"">" & _
+          SUMMARY_TEXT & " (" & cnt & " file" & IIf(cnt <> 1, "s", "") & ")</p>"
 
-    ' Try to insert before </body>
-    Dim posBody As Long
-    posBody = InStrRev(LCase$(htmlBody), "</body>")
-
-    If posBody > 0 Then
-        InsertSummaryLine = Left$(htmlBody, posBody - 1) & summaryHtml & Mid$(htmlBody, posBody)
+    Dim pos As Long: pos = InStrRev(LCase$(htmlBody), "</body>")
+    If pos > 0 Then
+        InjectSummaryLine = Left$(htmlBody, pos - 1) & tag & Mid$(htmlBody, pos)
     Else
-        ' No </body> tag – append at end
-        InsertSummaryLine = htmlBody & summaryHtml
+        InjectSummaryLine = htmlBody & tag
     End If
 End Function
 
 ' ===========================================================================
-' HELPER UTILITIES
+'  UTILITY HELPERS
 ' ===========================================================================
 
-' Strips HTML tags from a string (for extracting display text from anchors).
-Private Function StripHtmlTags(s As String) As String
-    Dim regex As Object
-    Set regex = CreateObject("VBScript.RegExp")
-    With regex
-        .Global = True
+Private Function NewRegex(pat As String, isGlobal As Boolean) As Object
+    Set NewRegex = CreateObject("VBScript.RegExp")
+    With NewRegex
+        .Global = isGlobal
         .IgnoreCase = True
         .MultiLine = True
-        .Pattern = "<[^>]+>"
+        .Pattern = pat
     End With
-    StripHtmlTags = Trim$(regex.Replace(s, ""))
 End Function
 
-' Removes characters illegal in Windows filenames and trims length.
-Private Function SanitizeFilename(rawName As String) As String
-    Dim s As String
-    s = rawName
+Private Function StripTags(s As String) As String
+    Dim re As Object: Set re = NewRegex("<[^>]+>", True)
+    StripTags = Trim$(re.Replace(s, ""))
+End Function
 
+Private Function MakeWindowsSafe(raw As String) As String
+    Dim s As String: s = raw
     ' Decode common HTML entities
     s = Replace(s, "&amp;", "&")
     s = Replace(s, "&lt;", "(")
@@ -426,105 +316,57 @@ Private Function SanitizeFilename(rawName As String) As String
     s = Replace(s, "&quot;", "'")
     s = Replace(s, "&nbsp;", " ")
 
-    ' Replace illegal filename characters
-    Dim regex As Object
-    Set regex = CreateObject("VBScript.RegExp")
-    With regex
-        .Global = True
-        .Pattern = "[\\/:*?""<>|]"
-    End With
-    s = regex.Replace(s, "_")
+    ' Strip illegal chars
+    Dim re As Object: Set re = NewRegex("[\\/:*?""<>|]", True)
+    s = re.Replace(s, "_")
 
-    ' Collapse multiple underscores/spaces
-    Dim regexMulti As Object
-    Set regexMulti = CreateObject("VBScript.RegExp")
-    With regexMulti
-        .Global = True
-        .Pattern = "[_ ]{2,}"
-    End With
-    s = regexMulti.Replace(s, "_")
+    ' Collapse runs of underscores / spaces
+    Dim re2 As Object: Set re2 = NewRegex("[_ ]{2,}", True)
+    s = Trim$(re2.Replace(s, "_"))
 
-    ' Trim whitespace and underscores from ends
-    s = Trim$(s)
-    Do While Len(s) > 0 And Left$(s, 1) = "_"
-        s = Mid$(s, 2)
-    Loop
-    Do While Len(s) > 0 And Right$(s, 1) = "_"
-        s = Left$(s, Len(s) - 1)
-    Loop
+    ' Trim leading/trailing underscores
+    Do While Len(s) > 0 And Left$(s, 1) = "_": s = Mid$(s, 2): Loop
+    Do While Len(s) > 0 And Right$(s, 1) = "_": s = Left$(s, Len(s) - 1): Loop
 
-    ' Limit total filename length (Windows MAX_PATH safety)
-    ' Reserve room for .url extension and temp path
-    If Len(s) > 150 Then
-        s = Left$(s, 150)
-    End If
+    ' Cap at 150 chars
+    If Len(s) > 150 Then s = Left$(s, 150)
+    If Len(Trim$(s)) = 0 Then s = "NetDocs_Document"
 
-    ' Fallback if empty after sanitization
-    If Len(Trim$(s)) = 0 Then
-        s = "NetDocs_Document"
-    End If
-
-    SanitizeFilename = s
+    MakeWindowsSafe = s
 End Function
 
-' Writes a Windows .url shortcut file.
-Private Sub WriteUrlFile(filePath As String, url As String)
-    Dim fNum As Integer
-    fNum = FreeFile
-    Open filePath For Output As #fNum
-    Print #fNum, "[InternetShortcut]"
-    Print #fNum, "URL=" & url
-    Close #fNum
-End Sub
+Private Function PrepareTempFolder() As String
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim folder As String
+    folder = Environ$("TEMP")
+    If Right$(folder, 1) <> "\" Then folder = folder & "\"
+    folder = folder & NETDOCS_TEMP_FOLDER & "\"
 
-' De-duplicates links by URL (keeps first occurrence).
-Private Function DeduplicateLinks(links As Collection) As Collection
+    If Not fso.FolderExists(folder) Then fso.CreateFolder folder
+    PrepareTempFolder = folder
+End Function
+
+Private Function DeduplicateByUrl(links As Collection) As Collection
     Dim result As New Collection
-    Dim seen As New Collection
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = vbTextCompare
+
     Dim i As Long
-    Dim linkData As Variant
-    Dim url As String
-
     For i = 1 To links.Count
-        linkData = links(i)
-        url = LCase$(CStr(linkData(0)))
-
-        Dim exists As Boolean
-        exists = False
-        On Error Resume Next
-        Dim tmp As String
-        tmp = seen(url)
-        If Err.Number = 0 Then exists = True
-        Err.Clear
-        On Error GoTo 0
-
-        If Not exists Then
-            seen.Add "", url
-            result.Add linkData
+        Dim entry As Variant: entry = links(i)
+        Dim u As String: u = CStr(entry(0))
+        If Not seen.Exists(u) Then
+            seen(u) = True
+            result.Add entry
         End If
     Next i
-
-    Set DeduplicateLinks = result
+    Set DeduplicateByUrl = result
 End Function
 
-' Returns a Collection of lowercase attachment filenames on the mail item.
-Private Function GetExistingAttachmentNames(oMail As Outlook.MailItem) As Collection
-    Dim result As New Collection
-    Dim i As Long
-    For i = 1 To oMail.Attachments.Count
-        On Error Resume Next
-        result.Add LCase$(oMail.Attachments(i).fileName), LCase$(oMail.Attachments(i).fileName)
-        On Error GoTo 0
-    Next i
-    Set GetExistingAttachmentNames = result
-End Function
-
-' Checks if a Collection contains a given key.
-Private Function CollectionContains(col As Collection, key As String) As Boolean
-    On Error Resume Next
-    Dim v As String
-    v = col(key)
-    CollectionContains = (Err.Number = 0)
-    Err.Clear
-    On Error GoTo 0
-End Function
+Private Sub WriteUrlShortcut(filePath As String, url As String)
+    Dim f As Integer: f = FreeFile
+    Open filePath For Output As #f
+    Print #f, "[InternetShortcut]"
+    Print #f, "URL=" & url
+    Close #f
+End Sub
