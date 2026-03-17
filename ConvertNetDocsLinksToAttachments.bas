@@ -164,7 +164,9 @@ Private Function CollectAllNetDocsLinks(htmlBody As String) As Collection
         Set mc = reA.Execute(htmlBody)
         Dim m As Object
         For Each m In mc
-            Dim aUrl As String:  aUrl = Trim$(m.SubMatches(0))
+            ' CRITICAL: URLs from HTML href attributes contain &amp; instead of &
+            ' Decode them to raw URLs immediately so the rest of the pipeline works
+            Dim aUrl As String:  aUrl = HtmlDecodeUrl(Trim$(m.SubMatches(0)))
             Dim aText As String: aText = StripTags(Trim$(m.SubMatches(1)))
             If Len(aUrl) > 0 Then
                 result.Add Array(aUrl, aText)
@@ -184,7 +186,7 @@ Private Function CollectAllNetDocsLinks(htmlBody As String) As Collection
     If reR.Test(stripped) Then
         Set mc = reR.Execute(stripped)
         For Each m In mc
-            Dim rUrl As String: rUrl = Trim$(m.SubMatches(0))
+            Dim rUrl As String: rUrl = HtmlDecodeUrl(Trim$(m.SubMatches(0)))
             If Len(rUrl) > 0 And Not seenUrls.Exists(rUrl) Then
                 result.Add Array(rUrl, "")
                 seenUrls(rUrl) = True
@@ -528,6 +530,23 @@ End Function
 Private Function StripTags(s As String) As String
     Dim re As Object: Set re = NewRegex("<[^>]+>", True)
     StripTags = Trim$(re.Replace(s, ""))
+End Function
+
+' Decodes HTML entities in URLs extracted from href attributes.
+' Must handle &amp;amp; (double-encoded) as well as &amp;
+Private Function HtmlDecodeUrl(s As String) As String
+    Dim r As String: r = s
+    ' First pass: &amp;amp; -> &amp; (fix double-encoding)
+    Do While InStr(r, "&amp;amp;") > 0
+        r = Replace(r, "&amp;amp;", "&amp;")
+    Loop
+    ' Second pass: &amp; -> &
+    r = Replace(r, "&amp;", "&")
+    r = Replace(r, "&lt;", "<")
+    r = Replace(r, "&gt;", ">")
+    r = Replace(r, "&quot;", """")
+    r = Replace(r, "&#39;", "'")
+    HtmlDecodeUrl = r
 End Function
 
 Private Function HtmlEncode(s As String) As String
