@@ -73,7 +73,7 @@ Public Sub ConvertNetDocsLinksToAttachments()
     ' --- 3. Group by document ID and pick OPEN URL + real name -------------
     '     Returns Collection of Array(openUrl, documentName, docId)
     Dim docs As Collection
-    Set docs = GroupByDocument(rawLinks)
+    Set docs = GroupByDocument(rawLinks, htmlBody)
 
     If docs.Count = 0 Then
         MsgBox "No usable NetDocuments OPEN links found.", vbInformation, "NetDocs Converter"
@@ -198,14 +198,88 @@ Private Function CollectAllNetDocsLinks(htmlBody As String) As Collection
 End Function
 
 ' ===========================================================================
+'  DOCUMENT NAME EXTRACTION FROM TABLE CONTEXT
+' ===========================================================================
+
+' Extracts document names from the table/row context surrounding ND links.
+' NetDocuments inserts tables like:
+'   <tr><td>test.docx</td><td><a href="...nd...">OPEN</a></td>...</tr>
+' The filename is plain text (not a link), in a sibling <td>.
+' Returns a Dictionary keyed by docId -> documentName
+Private Function ExtractDocNamesFromTables(htmlBody As String) As Object
+    Dim names As Object: Set names = CreateObject("Scripting.Dictionary")
+    names.CompareMode = vbTextCompare
+
+    ' Match each <tr> that contains a netdocuments.com link
+    Dim reTr As Object: Set reTr = NewRegex( _
+        "<tr\b[^>]*>([\s\S]*?)<\/tr>", True)
+
+    If Not reTr.Test(htmlBody) Then
+        Set ExtractDocNamesFromTables = names
+        Exit Function
+    End If
+
+    Dim mc As Object: Set mc = reTr.Execute(htmlBody)
+    Dim m As Object
+    For Each m In mc
+        Dim rowHtml As String: rowHtml = m.Value
+
+        ' Only process rows containing ND links
+        If InStr(LCase$(rowHtml), "netdocuments.com") = 0 Then GoTo NextRow
+
+        ' Extract doc ID from any ND URL in this row
+        Dim reUrl As Object: Set reUrl = NewRegex( _
+            "href\s*=\s*[""']([^""']*netdocuments\.com[^""']*)[""']", False)
+        If Not reUrl.Test(rowHtml) Then GoTo NextRow
+
+        Dim rowUrl As String: rowUrl = HtmlDecodeUrl(reUrl.Execute(rowHtml)(0).SubMatches(0))
+        Dim rowDocId As String: rowDocId = ExtractDocIdFromFilter(rowUrl)
+        If Len(rowDocId) = 0 Then rowDocId = DocIdFallback(rowUrl)
+        If Len(rowDocId) = 0 Then GoTo NextRow
+
+        ' Now find the document name: text in a <td> that is NOT an action label
+        ' and is NOT inside an <a> tag pointing to netdocuments.com
+        Dim reTd As Object: Set reTd = NewRegex("<td\b[^>]*>([\s\S]*?)<\/td>", True)
+        If reTd.Test(rowHtml) Then
+            Dim tdMatches As Object: Set tdMatches = reTd.Execute(rowHtml)
+            Dim td As Object
+            For Each td In tdMatches
+                Dim tdContent As String: tdContent = td.SubMatches(0)
+
+                ' Skip cells that contain ND links (these are OPEN/VIEW/GO TO cells)
+                If InStr(LCase$(tdContent), "netdocuments.com") > 0 Then GoTo NextTd
+
+                ' Get the text content of this cell
+                Dim cellText As String: cellText = Trim$(StripTags(tdContent))
+                If Len(cellText) = 0 Then GoTo NextTd
+                If IsActionLabel(cellText) Then GoTo NextTd
+
+                ' This is the document name
+                If Not names.Exists(rowDocId) Then
+                    names.Add rowDocId, cellText
+                End If
+NextTd:
+            Next td
+        End If
+NextRow:
+    Next m
+
+    Set ExtractDocNamesFromTables = names
+End Function
+
+' ===========================================================================
 '  DOCUMENT GROUPING
 ' ===========================================================================
 
 ' Groups links by document ID (from the filter= param).
 ' For each document, picks the OPEN URL and the real document name.
 ' Returns Collection of Array(openUrl, documentName, docId).
-Private Function GroupByDocument(rawLinks As Collection) As Collection
+Private Function GroupByDocument(rawLinks As Collection, htmlBody As String) As Collection
     Dim result As New Collection
+
+    ' First, extract document names from the table structure
+    ' (the filename is plain text in a <td>, not inside a link)
+    Dim tableNames As Object: Set tableNames = ExtractDocNamesFromTables(htmlBody)
 
     ' Dict keyed by docId -> Array(openUrl, bestName)
     Dim docMap As Object: Set docMap = CreateObject("Scripting.Dictionary")
@@ -241,8 +315,6 @@ Private Function GroupByDocument(rawLinks As Collection) As Collection
             If isOpen And Len(CStr(existing(0))) = 0 Then
                 existing(0) = url
             ElseIf isOpen Then
-                ' If we already have an open URL, keep first one
-                ' but override if current is cleaner
                 existing(0) = url
             End If
             ' Prefer real doc name over what we had
@@ -262,6 +334,18 @@ Private Function GroupByDocument(rawLinks As Collection) As Collection
 NextLink:
     Next i
 
+    ' Apply table-extracted names to any documents still missing a name
+    Dim k As Variant
+    For Each k In tableNames.Keys
+        If docMap.Exists(CStr(k)) Then
+            Dim cur As Variant: cur = docMap(CStr(k))
+            If Len(CStr(cur(1))) = 0 Then
+                cur(1) = CStr(tableNames(k))
+                docMap(CStr(k)) = cur
+            End If
+        End If
+    Next k
+
     ' Build result: only include documents where we found an OPEN URL
     Dim j As Long
     For j = 1 To docOrder.Count
@@ -271,9 +355,7 @@ NextLink:
         Dim oName As String: oName = CStr(info(1))
 
         ' If no OPEN URL found, fall back to first URL for this doc
-        ' (shouldn't happen with well-formed ND links, but be safe)
         If Len(oUrl) = 0 Then
-            ' Scan raw links for first URL with this docId
             For i = 1 To rawLinks.Count
                 entry = rawLinks(i)
                 If ExtractDocIdFromFilter(CStr(entry(0))) = docId Then
