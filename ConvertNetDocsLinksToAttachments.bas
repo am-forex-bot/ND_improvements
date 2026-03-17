@@ -411,21 +411,44 @@ End Function
 Private Function StripNetDocsFromHtml(htmlBody As String) As String
     Dim s As String: s = htmlBody
 
-    ' Remove <a> tags with netdocuments.com href
+    ' --- 1. Remove entire <table>/<div> blocks that contain netdocuments.com links
+    '     NetDocuments inserts tables with: filename | OPEN | VIEW | GO TO
+    '     and div blocks with bordered file name entries
+    Dim reT As Object: Set reT = NewRegex( _
+        "<table\b[^>]*>[\s\S]*?netdocuments\.com[\s\S]*?<\/table>", True)
+    s = reT.Replace(s, "")
+
+    ' Remove <div> blocks that contain netdocuments.com links
+    Dim reDiv As Object: Set reDiv = NewRegex( _
+        "<div\b[^>]*>[\s\S]*?netdocuments\.com[\s\S]*?<\/div>", True)
+    s = reDiv.Replace(s, "")
+
+    ' --- 2. Remove "Secured by NetDocuments" lines (any variation) -------------
+    '     May appear as <p>, <div>, <span>, or bare text with ® symbol
+    Dim reSec As Object: Set reSec = NewRegex( _
+        "<[^>]*>[^<]*Secured\s+by\s*[^<]*NetDocuments[^<]*<\/[^>]+>", True)
+    s = reSec.Replace(s, "")
+    ' Also catch it wrapped in multiple tags (e.g. <p><span>Secured by...</span></p>)
+    Dim reSec2 As Object: Set reSec2 = NewRegex( _
+        "<(p|div)\b[^>]*>\s*(<[^>]*>)*\s*Secured\s+by\s*[^<]*NetDocuments[\s\S]*?<\/\1>", True)
+    s = reSec2.Replace(s, "")
+
+    ' --- 3. Remove remaining <a> tags with netdocuments.com href ---------------
     Dim reA As Object: Set reA = NewRegex( _
         "<a\b[^>]*?\bhref\s*=\s*[""'][^""']*netdocuments\.com[^""']*[""'][^>]*>[\s\S]*?<\/a>", True)
     s = reA.Replace(s, "")
 
-    ' Remove raw URLs
+    ' --- 4. Remove raw ND URLs -------------------------------------------------
     Dim reR As Object: Set reR = NewRegex( _
         "https?://[^\s""'<>]*netdocuments\.com[^\s""'<>]*", True)
     s = reR.Replace(s, "")
 
-    ' Collapse empty wrappers left behind
+    ' --- 5. Collapse empty wrappers left behind --------------------------------
     Dim reE As Object: Set reE = NewRegex( _
-        "<(p|div|li|span)\b[^>]*>\s*(&nbsp;|\s|<br\s*/?>)*\s*<\/\1>", True)
+        "<(p|div|li|span|td|tr|table)\b[^>]*>\s*(&nbsp;|\s|<br\s*/?>)*\s*<\/\1>", True)
     s = reE.Replace(s, "")
     s = reE.Replace(s, "")   ' second pass for nesting
+    s = reE.Replace(s, "")   ' third pass for deeper nesting
 
     StripNetDocsFromHtml = s
 End Function
