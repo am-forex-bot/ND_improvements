@@ -2,17 +2,23 @@ Attribute VB_Name = "NetDocsLinkConverter"
 '==============================================================================
 ' NetDocuments Link-to-Attachment Converter for Microsoft Outlook
 '==============================================================================
-' PURPOSE:  Scans the active email for NetDocuments URLs, creates .url
-'           shortcut files, attaches them, and strips the links from the body.
+' PURPOSE:  Scans the active email for NetDocuments URLs, creates .html
+'           redirect files, attaches them, and strips the links from the body.
+'
+' HOW IT WORKS:
+'           Each .html file contains a lightweight redirect page that
+'           opens the NetDocuments URL in the default browser. ndOffice
+'           then intercepts the URL and opens the document in the native
+'           app (Word/Excel/etc). If the app is already running, ndOffice
+'           uses the existing instance — no duplicate windows.
 '
 ' INSTALL:  Alt+F11 in Outlook → Import File… → select this .bas
 '           -OR- paste into a new Module.
 '
 ' RUN:      Open an email → Alt+F8 → ConvertNetDocsLinksToAttachments → Run
 '
-' NOTES:    - .url files are written to %TEMP%\NetDocsLinks\
-'           - That folder MUST be whitelisted via registry/GPO if your org
-'             blocks .url files (see accompanying deployment guide).
+' NOTES:    - .html files are NOT blocked by Outlook attachment security,
+'             so no registry/GPO changes are needed.
 '           - Safe to run multiple times – skips already-attached filenames.
 '           - Does NOT control how Word/Excel open; relies on existing
 '             ndOffice / NetDocuments integration.
@@ -76,7 +82,7 @@ Public Sub ConvertNetDocsLinksToAttachments()
         attached(oMail.Attachments(a).FileName) = True
     Next a
 
-    ' --- 6. Create .url files and attach -----------------------------------
+    ' --- 6. Create .html redirect files and attach -------------------------
     Dim createdPaths As New Collection
     Dim attachCount As Long
     Dim i As Long
@@ -94,7 +100,7 @@ Public Sub ConvertNetDocsLinksToAttachments()
             Dim fPath As String
             fPath = tempDir & fName
 
-            WriteUrlShortcut fPath, sUrl
+            WriteHtmlRedirect fPath, sUrl, sName
             createdPaths.Add fPath
 
             oMail.Attachments.Add fPath, olByValue
@@ -185,6 +191,7 @@ End Function
 ' ===========================================================================
 
 ' Priority: displayText → filename in URL → docID → fallback
+' All filenames end with .html
 Private Function DetermineFilename(displayText As String, url As String) As String
     Dim base As String
 
@@ -210,7 +217,22 @@ Private Function DetermineFilename(displayText As String, url As String) As Stri
 
 Finish:
     base = MakeWindowsSafe(base)
-    If LCase$(Right$(base, 4)) <> ".url" Then base = base & ".url"
+
+    ' Strip any existing file extension (e.g. .docx from display text)
+    ' so the final file is cleanly named .html
+    Dim dotPos As Long: dotPos = InStrRev(base, ".")
+    If dotPos > 1 Then
+        Dim ext As String: ext = LCase$(Mid$(base, dotPos))
+        ' Only strip known document extensions to avoid mangling names with dots
+        If ext = ".doc" Or ext = ".docx" Or ext = ".xls" Or ext = ".xlsx" _
+           Or ext = ".ppt" Or ext = ".pptx" Or ext = ".pdf" Or ext = ".txt" _
+           Or ext = ".csv" Or ext = ".rtf" Or ext = ".msg" Or ext = ".html" _
+           Or ext = ".url" Then
+            base = Left$(base, dotPos - 1)
+        End If
+    End If
+
+    base = base & ".html"
     DetermineFilename = base
 End Function
 
@@ -240,7 +262,7 @@ Private Function DocIdFromUrl(url As String) As String
         End If
     Next p
 
-    ' Last-resort: final path segment ≥ 6 chars
+    ' Last-resort: final path segment >= 6 chars
     Dim reL As Object: Set reL = NewRegex("/([A-Za-z0-9\-]{6,})", True)
     If reL.Test(url) Then
         Dim mc As Object: Set mc = reL.Execute(url)
@@ -288,6 +310,61 @@ Private Function InjectSummaryLine(htmlBody As String, cnt As Long) As String
 End Function
 
 ' ===========================================================================
+'  HTML REDIRECT FILE WRITER
+' ===========================================================================
+
+' Creates a self-contained .html file that immediately redirects to the
+' NetDocuments URL. The page:
+'   1. Uses <meta http-equiv="refresh"> for instant redirect (works everywhere)
+'   2. Has a manual click-through link as fallback
+'   3. Shows the document name so the user knows what's opening
+'   4. ndOffice intercepts the ND URL and opens in the native app
+'   5. If Word/Excel is already open, ndOffice reuses that instance
+Private Sub WriteHtmlRedirect(filePath As String, url As String, docName As String)
+    Dim f As Integer: f = FreeFile
+    Dim safeUrl As String: safeUrl = HtmlEncode(url)
+    Dim safeTitle As String
+
+    If Len(Trim$(docName)) > 0 Then
+        safeTitle = HtmlEncode(docName)
+    Else
+        safeTitle = "NetDocuments Document"
+    End If
+
+    Open filePath For Output As #f
+    Print #f, "<!DOCTYPE html>"
+    Print #f, "<html><head>"
+    Print #f, "<meta charset=""utf-8"">"
+    Print #f, "<title>" & safeTitle & "</title>"
+    Print #f, "<meta http-equiv=""refresh"" content=""0;url=" & safeUrl & """>"
+    Print #f, "<style>"
+    Print #f, "  body { font-family: Segoe UI, Arial, sans-serif; margin: 40px;"
+    Print #f, "         color: #333; background: #f9f9f9; }"
+    Print #f, "  .card { background: #fff; border: 1px solid #ddd; border-radius: 8px;"
+    Print #f, "          padding: 30px; max-width: 500px; margin: 60px auto;"
+    Print #f, "          text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }"
+    Print #f, "  h2 { margin: 0 0 10px; font-size: 18px; color: #1a1a1a; }"
+    Print #f, "  p { font-size: 14px; color: #666; margin: 8px 0; }"
+    Print #f, "  a { color: #0066cc; text-decoration: none; }"
+    Print #f, "  a:hover { text-decoration: underline; }"
+    Print #f, "  .spinner { display: inline-block; width: 20px; height: 20px;"
+    Print #f, "             border: 3px solid #ddd; border-top-color: #0066cc;"
+    Print #f, "             border-radius: 50%; animation: spin 0.8s linear infinite;"
+    Print #f, "             margin-bottom: 15px; }"
+    Print #f, "  @keyframes spin { to { transform: rotate(360deg); } }"
+    Print #f, "</style>"
+    Print #f, "</head><body>"
+    Print #f, "<div class=""card"">"
+    Print #f, "  <div class=""spinner""></div>"
+    Print #f, "  <h2>" & safeTitle & "</h2>"
+    Print #f, "  <p>Opening in NetDocuments&#8230;</p>"
+    Print #f, "  <p><a href=""" & safeUrl & """>Click here if not redirected</a></p>"
+    Print #f, "</div>"
+    Print #f, "</body></html>"
+    Close #f
+End Sub
+
+' ===========================================================================
 '  UTILITY HELPERS
 ' ===========================================================================
 
@@ -304,6 +381,17 @@ End Function
 Private Function StripTags(s As String) As String
     Dim re As Object: Set re = NewRegex("<[^>]+>", True)
     StripTags = Trim$(re.Replace(s, ""))
+End Function
+
+' Encodes characters for safe HTML attribute/content use.
+Private Function HtmlEncode(s As String) As String
+    Dim r As String: r = s
+    r = Replace(r, "&", "&amp;")
+    r = Replace(r, """", "&quot;")
+    r = Replace(r, "<", "&lt;")
+    r = Replace(r, ">", "&gt;")
+    r = Replace(r, "'", "&#39;")
+    HtmlEncode = r
 End Function
 
 Private Function MakeWindowsSafe(raw As String) As String
@@ -362,11 +450,3 @@ Private Function DeduplicateByUrl(links As Collection) As Collection
     Next i
     Set DeduplicateByUrl = result
 End Function
-
-Private Sub WriteUrlShortcut(filePath As String, url As String)
-    Dim f As Integer: f = FreeFile
-    Open filePath For Output As #f
-    Print #f, "[InternetShortcut]"
-    Print #f, "URL=" & url
-    Close #f
-End Sub
