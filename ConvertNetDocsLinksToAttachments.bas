@@ -6,20 +6,21 @@ Attribute VB_Name = "NetDocsLinkConverter"
 '           redirect files, attaches them, and strips the links from the body.
 '
 ' HOW IT WORKS:
-'           Each .html file contains a lightweight redirect page that
-'           opens the NetDocuments URL in the default browser. ndOffice
-'           then intercepts the URL and opens the document in the native
-'           app (Word/Excel/etc). If the app is already running, ndOffice
-'           uses the existing instance — no duplicate windows.
+'           NetDocuments inserts multiple links per document (OPEN, VIEW,
+'           GO TO). This macro groups them by document ID, picks only the
+'           OPEN URL (which triggers ndOffice to open in native Word/Excel),
+'           and creates ONE .html redirect attachment per document.
 '
-' INSTALL:  Alt+F11 in Outlook → Import File… → select this .bas
+'           The document name comes from the nearby non-action hyperlink
+'           text (e.g. "test letter.docx"), not from action labels.
+'
+' INSTALL:  Alt+F11 in Outlook -> Import File... -> select this .bas
 '           -OR- paste into a new Module.
 '
-' RUN:      Open an email → Alt+F8 → ConvertNetDocsLinksToAttachments → Run
+' RUN:      Open an email -> Alt+F8 -> ConvertNetDocsLinksToAttachments -> Run
 '
-' NOTES:    - .html files are NOT blocked by Outlook attachment security,
-'             so no registry/GPO changes are needed.
-'           - Safe to run multiple times – skips already-attached filenames.
+' NOTES:    - .html files are NOT blocked by Outlook attachment security.
+'           - Safe to run multiple times - skips already-attached filenames.
 '           - Does NOT control how Word/Excel open; relies on existing
 '             ndOffice / NetDocuments integration.
 '==============================================================================
@@ -30,6 +31,9 @@ Option Explicit
 ' ---------------------------------------------------------------------------
 Private Const NETDOCS_TEMP_FOLDER As String = "NetDocsLinks"
 Private Const SUMMARY_TEXT As String = "Documents attached via NetDocuments"
+
+' Action labels to ignore when determining document names
+Private Const ACTION_LABELS As String = "OPEN|VIEW|GO TO|GOTO|EDIT|DOWNLOAD|PROFILE|CHECK OUT|CHECKOUT|CHECK IN|CHECKIN"
 
 ' ---------------------------------------------------------------------------
 '  ENTRY POINT
@@ -57,17 +61,24 @@ Public Sub ConvertNetDocsLinksToAttachments()
     Dim htmlBody As String
     htmlBody = oMail.HTMLBody
 
-    Dim links As Collection          ' Each item: Array(url, displayText)
-    Set links = CollectNetDocsLinks(htmlBody)
+    ' Collect ALL ND links: Array(url, displayText) for each
+    Dim rawLinks As Collection
+    Set rawLinks = CollectAllNetDocsLinks(htmlBody)
 
-    If links.Count = 0 Then
+    If rawLinks.Count = 0 Then
         MsgBox "No NetDocuments links found in this email.", vbInformation, "NetDocs Converter"
         Exit Sub
     End If
 
-    ' --- 3. De-duplicate by URL --------------------------------------------
-    Dim unique As Collection
-    Set unique = DeduplicateByUrl(links)
+    ' --- 3. Group by document ID and pick OPEN URL + real name -------------
+    '     Returns Collection of Array(openUrl, documentName, docId)
+    Dim docs As Collection
+    Set docs = GroupByDocument(rawLinks)
+
+    If docs.Count = 0 Then
+        MsgBox "No usable NetDocuments OPEN links found.", vbInformation, "NetDocs Converter"
+        Exit Sub
+    End If
 
     ' --- 4. Prepare temp folder --------------------------------------------
     Dim tempDir As String
@@ -87,20 +98,21 @@ Public Sub ConvertNetDocsLinksToAttachments()
     Dim attachCount As Long
     Dim i As Long
 
-    For i = 1 To unique.Count
-        Dim entry As Variant: entry = unique(i)
-        Dim sUrl As String:   sUrl = CStr(entry(0))
-        Dim sName As String:  sName = CStr(entry(1))
+    For i = 1 To docs.Count
+        Dim doc As Variant: doc = docs(i)
+        Dim openUrl As String:  openUrl = CStr(doc(0))
+        Dim docName As String:  docName = CStr(doc(1))
+        Dim docId As String:    docId = CStr(doc(2))
 
         Dim fName As String
-        fName = DetermineFilename(sName, sUrl)
+        fName = DetermineFilename(docName, docId)
 
         ' Skip if already attached (idempotent on re-run)
         If Not attached.Exists(fName) Then
             Dim fPath As String
             fPath = tempDir & fName
 
-            WriteHtmlRedirect fPath, sUrl, sName
+            WriteHtmlRedirect fPath, openUrl, docName
             createdPaths.Add fPath
 
             oMail.Attachments.Add fPath, olByValue
@@ -112,7 +124,7 @@ Public Sub ConvertNetDocsLinksToAttachments()
     ' --- 7. Strip NetDocuments links from HTML body ------------------------
     Dim cleaned As String
     cleaned = StripNetDocsFromHtml(htmlBody)
-    cleaned = InjectSummaryLine(cleaned, unique.Count)
+    cleaned = InjectSummaryLine(cleaned, docs.Count)
     oMail.HTMLBody = cleaned
 
     ' --- 8. Clean up temp files --------------------------------------------
@@ -135,10 +147,9 @@ End Sub
 '  LINK COLLECTION
 ' ===========================================================================
 
-' Scans HTMLBody and returns Collection of Array(url, displayText).
-' Pass 1: <a href="…netdocuments.com…">text</a>
-' Pass 2: raw URLs outside anchors
-Private Function CollectNetDocsLinks(htmlBody As String) As Collection
+' Collects ALL netdocuments.com links from the HTML body.
+' Returns Collection of Array(url, displayText) - one per link found.
+Private Function CollectAllNetDocsLinks(htmlBody As String) As Collection
     Dim result As New Collection
 
     ' --- Anchors -----------------------------------------------------------
@@ -163,9 +174,7 @@ Private Function CollectNetDocsLinks(htmlBody As String) As Collection
     End If
 
     ' --- Raw URLs (outside anchors) ----------------------------------------
-    ' Remove anchors first so we don't double-count
     Dim stripped As String: stripped = reA.Replace(htmlBody, " ")
-    ' Also remove any remaining href attrs
     Dim reH As Object: Set reH = NewRegex("href\s*=\s*[""'][^""']*[""']", True)
     stripped = reH.Replace(stripped, " ")
 
@@ -183,32 +192,190 @@ Private Function CollectNetDocsLinks(htmlBody As String) As Collection
         Next m
     End If
 
-    Set CollectNetDocsLinks = result
+    Set CollectAllNetDocsLinks = result
+End Function
+
+' ===========================================================================
+'  DOCUMENT GROUPING
+' ===========================================================================
+
+' Groups links by document ID (from the filter= param).
+' For each document, picks the OPEN URL and the real document name.
+' Returns Collection of Array(openUrl, documentName, docId).
+Private Function GroupByDocument(rawLinks As Collection) As Collection
+    Dim result As New Collection
+
+    ' Dict keyed by docId -> Array(openUrl, bestName)
+    Dim docMap As Object: Set docMap = CreateObject("Scripting.Dictionary")
+    docMap.CompareMode = vbTextCompare
+
+    ' Track insertion order
+    Dim docOrder As New Collection
+
+    Dim i As Long
+    For i = 1 To rawLinks.Count
+        Dim entry As Variant: entry = rawLinks(i)
+        Dim url As String:   url = CStr(entry(0))
+        Dim dText As String: dText = CStr(entry(1))
+
+        ' Extract doc ID from the filter parameter
+        Dim dId As String: dId = ExtractDocIdFromFilter(url)
+        If Len(dId) = 0 Then dId = DocIdFallback(url)
+        If Len(dId) = 0 Then GoTo NextLink
+
+        ' Determine if this is the OPEN URL:
+        '   has &open=1 but does NOT have &openMode=
+        Dim isOpen As Boolean
+        isOpen = IsOpenUrl(url)
+
+        ' Determine if display text is a real doc name (not an action label)
+        Dim isRealName As Boolean
+        isRealName = (Len(dText) > 0 And Not IsActionLabel(dText))
+
+        If docMap.Exists(dId) Then
+            ' Update existing entry
+            Dim existing As Variant: existing = docMap(dId)
+            ' Prefer OPEN URL over whatever we had
+            If isOpen And Len(CStr(existing(0))) = 0 Then
+                existing(0) = url
+            ElseIf isOpen Then
+                ' If we already have an open URL, keep first one
+                ' but override if current is cleaner
+                existing(0) = url
+            End If
+            ' Prefer real doc name over what we had
+            If isRealName And Len(CStr(existing(1))) = 0 Then
+                existing(1) = dText
+            End If
+            docMap(dId) = existing
+        Else
+            ' New document
+            Dim newEntry(0 To 1) As String
+            If isOpen Then newEntry(0) = url Else newEntry(0) = ""
+            If isRealName Then newEntry(1) = dText Else newEntry(1) = ""
+            docMap.Add dId, newEntry
+            docOrder.Add dId
+        End If
+
+NextLink:
+    Next i
+
+    ' Build result: only include documents where we found an OPEN URL
+    Dim j As Long
+    For j = 1 To docOrder.Count
+        Dim docId As String: docId = docOrder(j)
+        Dim info As Variant: info = docMap(docId)
+        Dim oUrl As String: oUrl = CStr(info(0))
+        Dim oName As String: oName = CStr(info(1))
+
+        ' If no OPEN URL found, fall back to first URL for this doc
+        ' (shouldn't happen with well-formed ND links, but be safe)
+        If Len(oUrl) = 0 Then
+            ' Scan raw links for first URL with this docId
+            For i = 1 To rawLinks.Count
+                entry = rawLinks(i)
+                If ExtractDocIdFromFilter(CStr(entry(0))) = docId Then
+                    oUrl = CStr(entry(0))
+                    Exit For
+                End If
+            Next i
+        End If
+
+        If Len(oUrl) > 0 Then
+            result.Add Array(oUrl, oName, docId)
+        End If
+    Next j
+
+    Set GroupByDocument = result
+End Function
+
+' Extracts the document ID from the filter= query parameter.
+' URL pattern: filter=%3D999%28XXXX-XXXX-XXXX%29
+' Decoded:     filter==999(XXXX-XXXX-XXXX)
+' Returns the ID portion (e.g. "4158-2396-4775")
+Private Function ExtractDocIdFromFilter(url As String) As String
+    ' Match the encoded form: filter=%3D999%28...%29
+    Dim re As Object: Set re = NewRegex( _
+        "filter=%3D999%28([A-Za-z0-9\-]+)%29", False)
+    If re.Test(url) Then
+        ExtractDocIdFromFilter = re.Execute(url)(0).SubMatches(0)
+        Exit Function
+    End If
+
+    ' Match the decoded form: filter==999(...)
+    Dim re2 As Object: Set re2 = NewRegex( _
+        "filter==999\(([A-Za-z0-9\-]+)\)", False)
+    If re2.Test(url) Then
+        ExtractDocIdFromFilter = re2.Execute(url)(0).SubMatches(0)
+        Exit Function
+    End If
+
+    ExtractDocIdFromFilter = ""
+End Function
+
+' Fallback doc ID extraction for non-standard ND URLs
+Private Function DocIdFallback(url As String) As String
+    Dim patterns As Variant
+    patterns = Array( _
+        "[?&]ndDocId=([A-Za-z0-9\-]+)", _
+        "/nddocview[^/]*/([A-Za-z0-9\-]+)", _
+        "/document/([A-Za-z0-9\-]+)", _
+        "/d/([A-Za-z0-9\-]+)")
+
+    Dim p As Variant
+    For Each p In patterns
+        Dim re As Object: Set re = NewRegex(CStr(p), False)
+        If re.Test(url) Then
+            DocIdFallback = re.Execute(url)(0).SubMatches(0)
+            Exit Function
+        End If
+    Next p
+    DocIdFallback = ""
+End Function
+
+' Returns True if the URL is an OPEN link:
+'   has &open=1 but does NOT have &openMode=
+Private Function IsOpenUrl(url As String) As Boolean
+    Dim lUrl As String: lUrl = LCase$(url)
+    If InStr(lUrl, "open=1") > 0 And InStr(lUrl, "openmode=") = 0 Then
+        IsOpenUrl = True
+    Else
+        IsOpenUrl = False
+    End If
+End Function
+
+' Returns True if the text is an action label (OPEN, VIEW, GO TO, etc.)
+Private Function IsActionLabel(txt As String) As Boolean
+    Dim upper As String: upper = UCase$(Trim$(txt))
+    Dim labels As Variant: labels = Split(ACTION_LABELS, "|")
+    Dim lbl As Variant
+    For Each lbl In labels
+        If upper = CStr(lbl) Then
+            IsActionLabel = True
+            Exit Function
+        End If
+    Next lbl
+    IsActionLabel = False
 End Function
 
 ' ===========================================================================
 '  FILENAME DETERMINATION
 ' ===========================================================================
 
-' Priority: displayText → filename in URL → docID → fallback
+' Priority: document name from grouping -> doc ID -> fallback
 ' All filenames end with .html
-Private Function DetermineFilename(displayText As String, url As String) As String
+Private Function DetermineFilename(docName As String, docId As String) As String
     Dim base As String
 
-    ' Priority 1 – hyperlink display text
-    If Len(Trim$(displayText)) > 0 Then
-        base = Trim$(displayText)
+    ' Priority 1 - real document name from hyperlink text
+    If Len(Trim$(docName)) > 0 Then
+        base = Trim$(docName)
         GoTo Finish
     End If
 
-    ' Priority 2 – filename extracted from URL path / query
-    base = FilenameFromUrl(url)
-    If Len(base) > 0 Then GoTo Finish
-
-    ' Priority 3 – document ID
-    Dim docId As String: docId = DocIdFromUrl(url)
-    If Len(docId) > 0 Then
-        base = "NetDocs_" & docId
+    ' Priority 2 - document ID
+    If Len(Trim$(docId)) > 0 Then
+        base = "NetDocs_" & Trim$(docId)
         GoTo Finish
     End If
 
@@ -218,12 +385,11 @@ Private Function DetermineFilename(displayText As String, url As String) As Stri
 Finish:
     base = MakeWindowsSafe(base)
 
-    ' Strip any existing file extension (e.g. .docx from display text)
+    ' Strip known document extensions (e.g. .docx from display text)
     ' so the final file is cleanly named .html
     Dim dotPos As Long: dotPos = InStrRev(base, ".")
     If dotPos > 1 Then
         Dim ext As String: ext = LCase$(Mid$(base, dotPos))
-        ' Only strip known document extensions to avoid mangling names with dots
         If ext = ".doc" Or ext = ".docx" Or ext = ".xls" Or ext = ".xlsx" _
            Or ext = ".ppt" Or ext = ".pptx" Or ext = ".pdf" Or ext = ".txt" _
            Or ext = ".csv" Or ext = ".rtf" Or ext = ".msg" Or ext = ".html" _
@@ -234,40 +400,6 @@ Finish:
 
     base = base & ".html"
     DetermineFilename = base
-End Function
-
-Private Function FilenameFromUrl(url As String) As String
-    Dim re As Object: Set re = NewRegex( _
-        "[\/?&=]([A-Za-z0-9_\-\. ]+\.(docx?|xlsx?|pptx?|pdf|txt|csv|rtf|msg))", False)
-    If re.Test(url) Then
-        FilenameFromUrl = re.Execute(url)(0).SubMatches(0)
-    End If
-End Function
-
-Private Function DocIdFromUrl(url As String) As String
-    Dim patterns As Variant
-    patterns = Array( _
-        "[?&]ndDocId=([A-Za-z0-9\-]+)", _
-        "/nddocview[^/]*/([A-Za-z0-9\-]+)", _
-        "/document/([A-Za-z0-9\-]+)", _
-        "/d/([A-Za-z0-9\-]+)", _
-        "/([0-9]{4,}[\-/][0-9]+)")
-
-    Dim p As Variant
-    For Each p In patterns
-        Dim re As Object: Set re = NewRegex(CStr(p), False)
-        If re.Test(url) Then
-            DocIdFromUrl = re.Execute(url)(0).SubMatches(0)
-            Exit Function
-        End If
-    Next p
-
-    ' Last-resort: final path segment >= 6 chars
-    Dim reL As Object: Set reL = NewRegex("/([A-Za-z0-9\-]{6,})", True)
-    If reL.Test(url) Then
-        Dim mc As Object: Set mc = reL.Execute(url)
-        DocIdFromUrl = mc(mc.Count - 1).SubMatches(0)
-    End If
 End Function
 
 ' ===========================================================================
@@ -313,13 +445,14 @@ End Function
 '  HTML REDIRECT FILE WRITER
 ' ===========================================================================
 
-' Creates a self-contained .html file that immediately redirects to the
-' NetDocuments URL. The page:
-'   1. Uses <meta http-equiv="refresh"> for instant redirect (works everywhere)
-'   2. Has a manual click-through link as fallback
-'   3. Shows the document name so the user knows what's opening
-'   4. ndOffice intercepts the ND URL and opens in the native app
-'   5. If Word/Excel is already open, ndOffice reuses that instance
+' Creates a self-contained .html file that opens the NetDocuments OPEN URL.
+'
+' Uses window.location.replace() which triggers browser extensions (ndOffice)
+' more reliably than <meta refresh>. Also has a prominent click-through link
+' as fallback, and a final meta-refresh safety net.
+'
+' ndOffice handles opening in the native app and reusing existing Word/Excel
+' instances via COM automation.
 Private Sub WriteHtmlRedirect(filePath As String, url As String, docName As String)
     Dim f As Integer: f = FreeFile
     Dim safeUrl As String: safeUrl = HtmlEncode(url)
@@ -331,12 +464,18 @@ Private Sub WriteHtmlRedirect(filePath As String, url As String, docName As Stri
         safeTitle = "NetDocuments Document"
     End If
 
+    ' Build the raw URL for JS (needs different escaping than HTML attributes)
+    Dim jsUrl As String: jsUrl = Replace(url, "\", "\\")
+    jsUrl = Replace(jsUrl, "'", "\'")
+    jsUrl = Replace(jsUrl, """", "\""")
+
     Open filePath For Output As #f
     Print #f, "<!DOCTYPE html>"
     Print #f, "<html><head>"
     Print #f, "<meta charset=""utf-8"">"
     Print #f, "<title>" & safeTitle & "</title>"
-    Print #f, "<meta http-equiv=""refresh"" content=""0;url=" & safeUrl & """>"
+    ' Meta refresh as last-resort fallback (2 second delay to let JS try first)
+    Print #f, "<meta http-equiv=""refresh"" content=""2;url=" & safeUrl & """>"
     Print #f, "<style>"
     Print #f, "  body { font-family: Segoe UI, Arial, sans-serif; margin: 40px;"
     Print #f, "         color: #333; background: #f9f9f9; }"
@@ -345,8 +484,10 @@ Private Sub WriteHtmlRedirect(filePath As String, url As String, docName As Stri
     Print #f, "          text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }"
     Print #f, "  h2 { margin: 0 0 10px; font-size: 18px; color: #1a1a1a; }"
     Print #f, "  p { font-size: 14px; color: #666; margin: 8px 0; }"
-    Print #f, "  a { color: #0066cc; text-decoration: none; }"
-    Print #f, "  a:hover { text-decoration: underline; }"
+    Print #f, "  a.open-link { display: inline-block; margin-top: 12px; padding: 10px 24px;"
+    Print #f, "     background: #0066cc; color: #fff; border-radius: 6px;"
+    Print #f, "     text-decoration: none; font-weight: bold; font-size: 14px; }"
+    Print #f, "  a.open-link:hover { background: #0052a3; }"
     Print #f, "  .spinner { display: inline-block; width: 20px; height: 20px;"
     Print #f, "             border: 3px solid #ddd; border-top-color: #0066cc;"
     Print #f, "             border-radius: 50%; animation: spin 0.8s linear infinite;"
@@ -357,9 +498,15 @@ Private Sub WriteHtmlRedirect(filePath As String, url As String, docName As Stri
     Print #f, "<div class=""card"">"
     Print #f, "  <div class=""spinner""></div>"
     Print #f, "  <h2>" & safeTitle & "</h2>"
-    Print #f, "  <p>Opening in NetDocuments&#8230;</p>"
-    Print #f, "  <p><a href=""" & safeUrl & """>Click here if not redirected</a></p>"
+    Print #f, "  <p>Opening document&#8230;</p>"
+    Print #f, "  <p><a class=""open-link"" href=""" & safeUrl & """>Open in NetDocuments</a></p>"
+    Print #f, "  <p style=""font-size:12px;color:#999;margin-top:16px;"">If the document does not open automatically, click the button above.</p>"
     Print #f, "</div>"
+    Print #f, "<script>"
+    ' Use location.replace so the browser navigates properly, triggering
+    ' ndOffice browser extension interception
+    Print #f, "  try { window.location.replace('" & jsUrl & "'); } catch(e) {}"
+    Print #f, "</script>"
     Print #f, "</body></html>"
     Close #f
 End Sub
@@ -383,7 +530,6 @@ Private Function StripTags(s As String) As String
     StripTags = Trim$(re.Replace(s, ""))
 End Function
 
-' Encodes characters for safe HTML attribute/content use.
 Private Function HtmlEncode(s As String) As String
     Dim r As String: r = s
     r = Replace(r, "&", "&amp;")
@@ -396,7 +542,6 @@ End Function
 
 Private Function MakeWindowsSafe(raw As String) As String
     Dim s As String: s = raw
-    ' Decode common HTML entities
     s = Replace(s, "&amp;", "&")
     s = Replace(s, "&lt;", "(")
     s = Replace(s, "&gt;", ")")
@@ -404,19 +549,15 @@ Private Function MakeWindowsSafe(raw As String) As String
     s = Replace(s, "&quot;", "'")
     s = Replace(s, "&nbsp;", " ")
 
-    ' Strip illegal chars
     Dim re As Object: Set re = NewRegex("[\\/:*?""<>|]", True)
     s = re.Replace(s, "_")
 
-    ' Collapse runs of underscores / spaces
     Dim re2 As Object: Set re2 = NewRegex("[_ ]{2,}", True)
     s = Trim$(re2.Replace(s, "_"))
 
-    ' Trim leading/trailing underscores
     Do While Len(s) > 0 And Left$(s, 1) = "_": s = Mid$(s, 2): Loop
     Do While Len(s) > 0 And Right$(s, 1) = "_": s = Left$(s, Len(s) - 1): Loop
 
-    ' Cap at 150 chars
     If Len(s) > 150 Then s = Left$(s, 150)
     If Len(Trim$(s)) = 0 Then s = "NetDocs_Document"
 
@@ -432,21 +573,4 @@ Private Function PrepareTempFolder() As String
 
     If Not fso.FolderExists(folder) Then fso.CreateFolder folder
     PrepareTempFolder = folder
-End Function
-
-Private Function DeduplicateByUrl(links As Collection) As Collection
-    Dim result As New Collection
-    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
-    seen.CompareMode = vbTextCompare
-
-    Dim i As Long
-    For i = 1 To links.Count
-        Dim entry As Variant: entry = links(i)
-        Dim u As String: u = CStr(entry(0))
-        If Not seen.Exists(u) Then
-            seen(u) = True
-            result.Add entry
-        End If
-    Next i
-    Set DeduplicateByUrl = result
 End Function
