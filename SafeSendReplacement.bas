@@ -3,14 +3,17 @@ Attribute VB_Name = "SafeSendReplacement"
 ' SafeSend Replacement - External Recipient Confirmation for Outlook
 '==============================================================================
 ' PURPOSE:  Replaces VIPRE SafeSend with a lightweight VBA alternative.
-'           Prompts users to confirm external recipients before sending.
+'           Shows a checkbox-based confirmation dialog (matching SafeSend's UI)
+'           for external recipients AND attachments.
 '           Smart enough to only prompt ONCE per email - if another add-in
 '           (e.g. NetDocuments ndMail) cancels the send after confirmation,
 '           the user won't be prompted again on the retry.
 '
 ' INSTALL:
 '   1) Disable/remove the real SafeSend add-in
-'   2) In Outlook: Alt+F11 -> Import File... -> select this .bas
+'   2) In Outlook: Alt+F11 -> File -> Import File...
+'      -> import SafeSendReplacement.bas
+'      -> import frmSafeSend.frm
 '   3) Paste the following into ThisOutlookSession (double-click it):
 '
 '        Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
@@ -61,23 +64,28 @@ Public Function SafeSendCheck(ByVal Item As Object) As Boolean
     ' No external recipients - let it through
     If externals.Count = 0 Then Exit Function
 
-    ' Build confirmation dialog
-    Dim msg As String
-    msg = BuildConfirmationMessage(Item, externals)
+    ' Collect attachments
+    Dim attachments As Collection
+    Set attachments = GetAttachmentList(Item)
 
-    ' Show dialog - vbYesNo with warning icon
-    Dim result As VbMsgBoxResult
-    result = MsgBox(msg, vbYesNo + vbExclamation + vbDefaultButton2, _
-                    "External Recipients Detected")
+    ' Show the confirmation form
+    Dim frm As frmSafeSend
+    Set frm = New frmSafeSend
+    frm.SetData externals, attachments, Item.Subject
+    frm.BuildUI
+    frm.Show vbModal
 
-    If result = vbYes Then
-        ' User confirmed - stamp the item so we don't ask again
+    If frm.UserConfirmed Then
+        ' User confirmed everything - stamp so we don't ask again
         StampConfirmedFlag Item
         SafeSendCheck = False  ' allow send
     Else
-        ' User said No - cancel the send
+        ' User cancelled - block the send
         SafeSendCheck = True
     End If
+
+    Unload frm
+    Set frm = Nothing
 
     Exit Function
 ErrHandler:
@@ -89,8 +97,8 @@ End Function
 '  EXTERNAL RECIPIENT DETECTION
 ' ---------------------------------------------------------------------------
 
-' Returns a Collection of external recipient display strings.
-' Each entry is "Name <email>" for display in the confirmation dialog.
+' Returns a Collection of strings in "TYPE|display" format.
+' e.g. "TO|John Smith <john@external.com>"
 Private Function GetExternalRecipients(ByVal Item As Object) As Collection
     Dim result As New Collection
     Dim domains() As String
@@ -124,21 +132,23 @@ Private Function GetExternalRecipients(ByVal Item As Object) As Collection
             Next d
 
             If Not isInternal Then
-                Dim displayEntry As String
+                Dim displayText As String
                 If LCase$(recip.Name) <> LCase$(emailAddr) Then
-                    displayEntry = recip.Name & " <" & emailAddr & ">"
+                    displayText = recip.Name & " <" & emailAddr & ">"
                 Else
-                    displayEntry = emailAddr
+                    displayText = emailAddr
                 End If
 
-                ' Add recipient type label
+                ' Format as "TYPE|display"
+                Dim typeLabel As String
                 Select Case recip.Type
-                    Case 1: displayEntry = "[To]  " & displayEntry      ' olTo
-                    Case 2: displayEntry = "[CC]  " & displayEntry      ' olCC
-                    Case 3: displayEntry = "[BCC] " & displayEntry      ' olBCC
+                    Case 1: typeLabel = "TO"      ' olTo
+                    Case 2: typeLabel = "CC"      ' olCC
+                    Case 3: typeLabel = "BCC"     ' olBCC
+                    Case Else: typeLabel = "TO"
                 End Select
 
-                result.Add displayEntry
+                result.Add typeLabel & "|" & displayText
             End If
         End If
 NextRecip:
@@ -146,6 +156,57 @@ NextRecip:
 
     Set GetExternalRecipients = result
 End Function
+
+' ---------------------------------------------------------------------------
+'  ATTACHMENT LIST
+' ---------------------------------------------------------------------------
+
+' Returns a Collection of strings in "filename|sizeText" format.
+' e.g. "report.pdf|1.2 MB"
+Private Function GetAttachmentList(ByVal Item As Object) As Collection
+    Dim result As New Collection
+
+    On Error Resume Next
+    Dim att As Object  ' Outlook.Attachment
+    For Each att In Item.Attachments
+        ' Skip hidden/inline attachments (embedded images etc.)
+        ' Type 1 = olByValue (regular file attachment)
+        If att.Type = 1 Then
+            Dim sizeText As String
+            Dim fileSize As Long
+            fileSize = 0
+
+            ' Try to get size (available in Outlook 2010+)
+            fileSize = att.Size
+            If Err.Number <> 0 Then
+                Err.Clear
+                sizeText = ""
+            Else
+                sizeText = FormatFileSize(fileSize)
+            End If
+
+            result.Add att.FileName & "|" & sizeText
+        End If
+    Next att
+    On Error GoTo 0
+
+    Set GetAttachmentList = result
+End Function
+
+' Formats bytes into a human-readable string.
+Private Function FormatFileSize(ByVal bytes As Long) As String
+    If bytes < 1024 Then
+        FormatFileSize = bytes & " B"
+    ElseIf bytes < 1048576 Then
+        FormatFileSize = Format$(bytes / 1024, "#,##0") & " KB"
+    Else
+        FormatFileSize = Format$(bytes / 1048576, "#,##0.0") & " MB"
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+'  SMTP ADDRESS RESOLUTION
+' ---------------------------------------------------------------------------
 
 ' Resolves the SMTP email address from a Recipient object.
 ' Handles both SMTP and Exchange (EX) address types.
@@ -189,37 +250,6 @@ ErrHandler:
     ' Fallback: return raw address
     On Error Resume Next
     GetSmtpAddress = LCase$(recip.Address)
-End Function
-
-' ---------------------------------------------------------------------------
-'  CONFIRMATION DIALOG
-' ---------------------------------------------------------------------------
-
-' Builds the confirmation message showing all external recipients.
-Private Function BuildConfirmationMessage(ByVal Item As Object, _
-                                          externals As Collection) As String
-    Dim msg As String
-    msg = "This email is addressed to " & externals.Count & " external recipient"
-    If externals.Count > 1 Then msg = msg & "s"
-    msg = msg & ":" & vbCrLf & vbCrLf
-
-    Dim entry As Variant
-    Dim count As Long: count = 0
-    For Each entry In externals
-        count = count + 1
-        msg = msg & "    " & entry & vbCrLf
-
-        ' Cap display at 15 recipients to avoid a huge dialog
-        If count >= 15 And externals.Count > 15 Then
-            msg = msg & "    ... and " & (externals.Count - 15) & " more" & vbCrLf
-            Exit For
-        End If
-    Next entry
-
-    msg = msg & vbCrLf & "Subject: " & Item.Subject & vbCrLf
-    msg = msg & vbCrLf & "Are you sure you want to send this email?"
-
-    BuildConfirmationMessage = msg
 End Function
 
 ' ---------------------------------------------------------------------------
