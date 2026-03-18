@@ -11,16 +11,11 @@ Attribute VB_Name = "SafeSendReplacement"
 '
 ' INSTALL:
 '   1) Disable/remove the real SafeSend add-in
-'   2) In Outlook: Alt+F11 -> File -> Import File...
-'      -> import SafeSendReplacement.bas
-'      -> import frmSafeSend.frm
-'   3) Paste the following into ThisOutlookSession (double-click it):
-'
-'        Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
-'            Cancel = SafeSendCheck(Item)
-'        End Sub
-'
-'   4) Restart Outlook. Done.
+'   2) In Outlook: File -> Options -> Trust Center -> Trust Center Settings
+'      -> Macro Settings -> tick "Trust access to the VBA project object model"
+'   3) Alt+F11 -> File -> Import File... -> select this .bas
+'   4) Alt+F8 -> run "InstallSafeSend"  (creates the form + event hook)
+'   5) Restart Outlook. Done.
 '
 ' CONFIG:   Edit the INTERNAL_DOMAINS constant below.
 '==============================================================================
@@ -288,3 +283,233 @@ Private Sub ClearConfirmedFlag(ByVal Item As Object)
     End If
     On Error GoTo 0
 End Sub
+
+' ===========================================================================
+'  ONE-TIME INSTALLER - run this once via Alt+F8 -> InstallSafeSend
+' ===========================================================================
+' Creates the frmSafeSend UserForm, adds the 3 design-time controls,
+' injects the code-behind, and wires up ThisOutlookSession.
+' Requires: "Trust access to the VBA project object model" enabled.
+
+Public Sub InstallSafeSend()
+    On Error GoTo ErrHandler
+
+    Dim proj As Object
+    Set proj = Application.VBE.ActiveVBProject
+
+    ' -- Check if form already exists
+    Dim comp As Object
+    Dim formExists As Boolean: formExists = False
+    For Each comp In proj.VBComponents
+        If comp.Name = "frmSafeSend" Then
+            formExists = True
+            Exit For
+        End If
+    Next comp
+
+    If formExists Then
+        Dim ans As VbMsgBoxResult
+        ans = MsgBox("frmSafeSend already exists. Delete and recreate it?", _
+                      vbYesNo + vbQuestion, "SafeSend Install")
+        If ans = vbNo Then Exit Sub
+        proj.VBComponents.Remove proj.VBComponents("frmSafeSend")
+    End If
+
+    ' -- Create the UserForm
+    Dim frm As Object  ' VBComponent
+    Set frm = proj.VBComponents.Add(3)  ' vbext_ct_MSForm = 3
+    frm.Name = "frmSafeSend"
+
+    ' Set form properties
+    Dim designer As Object
+    Set designer = frm.designer
+    designer.Caption = "Confirm External Recipients"
+
+    ' -- Add CheckBox: chkSelectAll
+    Dim chkAll As Object
+    Set chkAll = designer.Controls.Add("Forms.CheckBox.1", "chkSelectAll")
+    chkAll.Caption = "Select all"
+    chkAll.Left = 8
+    chkAll.Top = 24
+    chkAll.Width = 416
+    chkAll.Height = 16
+
+    ' -- Add CommandButton: btnSend
+    Dim btnS As Object
+    Set btnS = designer.Controls.Add("Forms.CommandButton.1", "btnSend")
+    btnS.Caption = "Send"
+    btnS.Left = 290
+    btnS.Top = 200
+    btnS.Width = 66
+    btnS.Height = 24
+
+    ' -- Add CommandButton: btnCancel
+    Dim btnC As Object
+    Set btnC = designer.Controls.Add("Forms.CommandButton.1", "btnCancel")
+    btnC.Caption = "Cancel"
+    btnC.Left = 362
+    btnC.Top = 200
+    btnC.Width = 66
+    btnC.Height = 24
+
+    ' -- Inject the code-behind
+    Dim code As String
+    code = FormCodeBehind()
+    frm.CodeModule.DeleteLines 1, frm.CodeModule.CountOfLines
+    frm.CodeModule.AddFromString code
+
+    ' -- Wire up ThisOutlookSession if not already done
+    Dim tos As Object
+    Set tos = proj.VBComponents("ThisOutlookSession")
+    Dim existing As String
+    existing = tos.CodeModule.Lines(1, tos.CodeModule.CountOfLines)
+
+    If InStr(1, existing, "SafeSendCheck", vbTextCompare) = 0 Then
+        tos.CodeModule.AddFromString vbCrLf & _
+            "Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)" & vbCrLf & _
+            "    Cancel = SafeSendCheck(Item)" & vbCrLf & _
+            "End Sub"
+    End If
+
+    MsgBox "SafeSend installed successfully!" & vbCrLf & vbCrLf & _
+           "Please restart Outlook for the ItemSend hook to take effect.", _
+           vbInformation, "SafeSend Install"
+    Exit Sub
+
+ErrHandler:
+    If Err.Number = 6068 Or InStr(1, Err.Description, "programmatic access", vbTextCompare) > 0 Then
+        MsgBox "Access denied." & vbCrLf & vbCrLf & _
+               "Please enable: File -> Options -> Trust Center -> " & _
+               "Trust Center Settings -> Macro Settings -> " & vbCrLf & _
+               """Trust access to the VBA project object model""", _
+               vbCritical, "SafeSend Install"
+    Else
+        MsgBox "Error " & Err.Number & ": " & Err.Description, _
+               vbCritical, "SafeSend Install"
+    End If
+End Sub
+
+' Returns the complete code-behind for frmSafeSend as a string.
+Private Function FormCodeBehind() As String
+    Dim c As String
+    c = "Option Explicit" & vbCrLf & vbCrLf
+    c = c & "Private m_confirmed As Boolean" & vbCrLf
+    c = c & "Private m_recipients As Collection" & vbCrLf
+    c = c & "Private m_attachments As Collection" & vbCrLf
+    c = c & "Private m_subject As String" & vbCrLf
+    c = c & "Private m_itemCheckboxes As Collection" & vbCrLf & vbCrLf
+
+    ' -- UserConfirmed property
+    c = c & "Public Property Get UserConfirmed() As Boolean" & vbCrLf
+    c = c & "    UserConfirmed = m_confirmed" & vbCrLf
+    c = c & "End Property" & vbCrLf & vbCrLf
+
+    ' -- SetData
+    c = c & "Public Sub SetData(recipients As Collection, attachments As Collection, subject As String)" & vbCrLf
+    c = c & "    Set m_recipients = recipients" & vbCrLf
+    c = c & "    Set m_attachments = attachments" & vbCrLf
+    c = c & "    m_subject = subject" & vbCrLf
+    c = c & "End Sub" & vbCrLf & vbCrLf
+
+    ' -- BuildUI
+    c = c & "Public Sub BuildUI()" & vbCrLf
+    c = c & "    m_confirmed = False" & vbCrLf
+    c = c & "    Set m_itemCheckboxes = New Collection" & vbCrLf & vbCrLf
+    c = c & "    Dim lblHeader As MSForms.Label" & vbCrLf
+    c = c & "    Set lblHeader = Me.Controls.Add(""Forms.Label.1"", ""lblHeader"")" & vbCrLf
+    c = c & "    lblHeader.Left = 8: lblHeader.Top = 4: lblHeader.Width = 416: lblHeader.Height = 16" & vbCrLf
+    c = c & "    lblHeader.Caption = ""Please confirm that the following recipient(s) should receive this message""" & vbCrLf
+    c = c & "    lblHeader.WordWrap = True" & vbCrLf & vbCrLf
+    c = c & "    chkSelectAll.Left = 8: chkSelectAll.Top = 24: chkSelectAll.Width = 416" & vbCrLf
+    c = c & "    chkSelectAll.Value = False" & vbCrLf & vbCrLf
+    c = c & "    Dim yStart As Long: yStart = 44" & vbCrLf & vbCrLf
+    c = c & "    If m_attachments.Count > 0 Then" & vbCrLf
+    c = c & "        Dim lblAttach As MSForms.Label" & vbCrLf
+    c = c & "        Set lblAttach = Me.Controls.Add(""Forms.Label.1"", ""lblAttachWarn"")" & vbCrLf
+    c = c & "        lblAttach.Left = 8: lblAttach.Top = yStart: lblAttach.Width = 416: lblAttach.Height = 16" & vbCrLf
+    c = c & "        lblAttach.Caption = ""This email has file(s) attached and they should be confirmed below""" & vbCrLf
+    c = c & "        lblAttach.ForeColor = RGB(255, 0, 0)" & vbCrLf
+    c = c & "        lblAttach.WordWrap = True" & vbCrLf
+    c = c & "        yStart = yStart + 20" & vbCrLf
+    c = c & "    End If" & vbCrLf & vbCrLf
+    c = c & "    Dim fra As MSForms.Frame" & vbCrLf
+    c = c & "    Set fra = Me.Controls.Add(""Forms.Frame.1"", ""fraItems"")" & vbCrLf
+    c = c & "    fra.Left = 4: fra.Top = yStart: fra.Width = 432: fra.Caption = """"" & vbCrLf
+    c = c & "    fra.BorderStyle = 0: fra.SpecialEffect = 0" & vbCrLf
+    c = c & "    fra.ScrollBars = 2: fra.KeepScrollBarsVisible = 0" & vbCrLf & vbCrLf
+    c = c & "    Dim yPos As Long: yPos = 4" & vbCrLf
+    c = c & "    Dim i As Long" & vbCrLf
+    c = c & "    Dim parts() As String" & vbCrLf
+    c = c & "    Dim chk As MSForms.CheckBox" & vbCrLf
+    c = c & "    Dim lbl As MSForms.Label" & vbCrLf & vbCrLf
+    c = c & "    For i = 1 To m_recipients.Count" & vbCrLf
+    c = c & "        parts = Split(m_recipients(i), ""|"")" & vbCrLf
+    c = c & "        Set lbl = fra.Controls.Add(""Forms.Label.1"", ""lblType"" & i)" & vbCrLf
+    c = c & "        lbl.Left = 4: lbl.Top = yPos + 2: lbl.Width = 28: lbl.Height = 14" & vbCrLf
+    c = c & "        lbl.Caption = parts(0) & "":""" & vbCrLf
+    c = c & "        Set chk = fra.Controls.Add(""Forms.CheckBox.1"", ""chkRecip"" & i)" & vbCrLf
+    c = c & "        chk.Left = 32: chk.Top = yPos: chk.Width = 392: chk.Height = 14" & vbCrLf
+    c = c & "        chk.Caption = parts(1): chk.Value = False" & vbCrLf
+    c = c & "        m_itemCheckboxes.Add chk" & vbCrLf
+    c = c & "        yPos = yPos + 18" & vbCrLf
+    c = c & "    Next i" & vbCrLf & vbCrLf
+    c = c & "    If m_attachments.Count > 0 Then" & vbCrLf
+    c = c & "        yPos = yPos + 4" & vbCrLf
+    c = c & "        For i = 1 To m_attachments.Count" & vbCrLf
+    c = c & "            parts = Split(m_attachments(i), ""|"")" & vbCrLf
+    c = c & "            Set lbl = fra.Controls.Add(""Forms.Label.1"", ""lblFile"" & i)" & vbCrLf
+    c = c & "            lbl.Left = 4: lbl.Top = yPos + 2: lbl.Width = 28: lbl.Height = 14" & vbCrLf
+    c = c & "            If i = 1 Then lbl.Caption = ""Files:"" Else lbl.Caption = """"" & vbCrLf
+    c = c & "            Set chk = fra.Controls.Add(""Forms.CheckBox.1"", ""chkFile"" & i)" & vbCrLf
+    c = c & "            chk.Left = 32: chk.Top = yPos: chk.Width = 392: chk.Height = 14" & vbCrLf
+    c = c & "            chk.Caption = parts(0) & ""  "" & parts(1): chk.Value = False" & vbCrLf
+    c = c & "            m_itemCheckboxes.Add chk" & vbCrLf
+    c = c & "            yPos = yPos + 18" & vbCrLf
+    c = c & "        Next i" & vbCrLf
+    c = c & "    End If" & vbCrLf & vbCrLf
+    c = c & "    Dim contentHeight As Long: contentHeight = yPos + 8" & vbCrLf
+    c = c & "    Dim maxFrameHeight As Long: maxFrameHeight = 280" & vbCrLf
+    c = c & "    If contentHeight <= maxFrameHeight Then" & vbCrLf
+    c = c & "        fra.Height = contentHeight: fra.ScrollBars = 0" & vbCrLf
+    c = c & "    Else" & vbCrLf
+    c = c & "        fra.Height = maxFrameHeight: fra.ScrollHeight = contentHeight" & vbCrLf
+    c = c & "    End If" & vbCrLf & vbCrLf
+    c = c & "    Dim btnY As Long: btnY = fra.Top + fra.Height + 8" & vbCrLf
+    c = c & "    btnSend.Left = 290: btnSend.Top = btnY: btnSend.Width = 66: btnSend.Height = 24" & vbCrLf
+    c = c & "    btnCancel.Left = 362: btnCancel.Top = btnY: btnCancel.Width = 66: btnCancel.Height = 24" & vbCrLf & vbCrLf
+    c = c & "    Me.Caption = ""Confirm External Recipients""" & vbCrLf
+    c = c & "    Dim formHeight As Long: formHeight = btnY + btnSend.Height + 12" & vbCrLf
+    c = c & "    Me.Width = 450: Me.Height = formHeight + 30" & vbCrLf
+    c = c & "End Sub" & vbCrLf & vbCrLf
+
+    ' -- Event handlers
+    c = c & "Private Sub chkSelectAll_Click()" & vbCrLf
+    c = c & "    Dim chk As MSForms.CheckBox: Dim i As Long" & vbCrLf
+    c = c & "    For i = 1 To m_itemCheckboxes.Count" & vbCrLf
+    c = c & "        Set chk = m_itemCheckboxes(i): chk.Value = chkSelectAll.Value" & vbCrLf
+    c = c & "    Next i" & vbCrLf
+    c = c & "End Sub" & vbCrLf & vbCrLf
+
+    c = c & "Private Sub btnSend_Click()" & vbCrLf
+    c = c & "    Dim chk As MSForms.CheckBox: Dim allChecked As Boolean: allChecked = True: Dim i As Long" & vbCrLf
+    c = c & "    For i = 1 To m_itemCheckboxes.Count" & vbCrLf
+    c = c & "        Set chk = m_itemCheckboxes(i)" & vbCrLf
+    c = c & "        If chk.Value = False Then allChecked = False: Exit For" & vbCrLf
+    c = c & "    Next i" & vbCrLf
+    c = c & "    If Not allChecked Then" & vbCrLf
+    c = c & "        MsgBox ""Please confirm all recipients and attachments before sending."", vbExclamation, ""Confirmation Required""" & vbCrLf
+    c = c & "        Exit Sub" & vbCrLf
+    c = c & "    End If" & vbCrLf
+    c = c & "    m_confirmed = True: Me.Hide" & vbCrLf
+    c = c & "End Sub" & vbCrLf & vbCrLf
+
+    c = c & "Private Sub btnCancel_Click()" & vbCrLf
+    c = c & "    m_confirmed = False: Me.Hide" & vbCrLf
+    c = c & "End Sub" & vbCrLf & vbCrLf
+
+    c = c & "Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)" & vbCrLf
+    c = c & "    If CloseMode = 0 Then m_confirmed = False: Cancel = 1: Me.Hide" & vbCrLf
+    c = c & "End Sub" & vbCrLf
+
+    FormCodeBehind = c
+End Function
