@@ -3,13 +3,13 @@ Attribute VB_Name = "SafeSendReplacement"
 ' SafeSend Replacement - External Recipient Confirmation for Outlook
 '==============================================================================
 ' PURPOSE:  Replaces VIPRE SafeSend with a lightweight VBA alternative.
-'           Warns when sending to external recipients and lists attachments.
-'           Lets you REMOVE specific recipients or attachments before sending.
-'           Only prompts ONCE per email draft.
+'           Shows a checkbox form where you can UNTICK recipients or
+'           attachments to remove them before sending.
+'           Falls back to MsgBox+InputBox if the form isn't set up yet.
 '
 ' INSTALL:
-'   1) Disable/remove the real SafeSend add-in
-'   2) In Outlook: Alt+F11 > File > Import File > select this .bas
+'   1) Alt+F11 > File > Import File > select this .bas file
+'   2) Create the UserForm (see instructions in frmSafeSend_code.txt)
 '   3) Double-click ThisOutlookSession and paste:
 '
 '        Private Sub Application_ItemSend(ByVal Item As Object, Cancel As Boolean)
@@ -18,14 +18,10 @@ Attribute VB_Name = "SafeSendReplacement"
 '
 '   4) Restart Outlook. Done.
 '
-' HOW IT WORKS:
-'   When you hit Send and there are external recipients, you get a dialog:
-'     YES     = Send to everyone listed (no changes)
-'     NO      = Opens a second prompt where you type the numbers of
-'               recipients/attachments to REMOVE before sending
-'     CANCEL  = Don't send the email
+' NOTE:  If you skip step 2, it still works - you just get a simpler
+'        Yes/No/Cancel dialog instead of checkboxes.
 '
-' CONFIG:   Edit the INTERNAL_DOMAINS constant below.
+' CONFIG: Edit the INTERNAL_DOMAINS constant below.
 '==============================================================================
 Option Explicit
 
@@ -35,6 +31,20 @@ Option Explicit
 Private Const INTERNAL_DOMAINS As String = "wallace.co.uk,wallace.onmicrosoft.com"
 Private Const CHECK_BCC As Boolean = True
 Private Const CONFIRMED_FLAG As String = "_SafeSendConfirmed"
+
+' ---------------------------------------------------------------------------
+'  SHARED DATA (read/written by frmSafeSend)
+' ---------------------------------------------------------------------------
+Public g_SSSubject As String
+Public g_SSRecipCount As Long
+Public g_SSRecipients() As String
+Public g_SSRecipIndices() As Long
+Public g_SSRecipChecked() As Boolean
+Public g_SSAttCount As Long
+Public g_SSAttachments() As String
+Public g_SSAttIndices() As Long
+Public g_SSAttChecked() As Boolean
+Public g_SSSendApproved As Boolean
 
 ' ---------------------------------------------------------------------------
 '  MAIN ENTRY POINT - called from ThisOutlookSession
@@ -60,7 +70,20 @@ Public Function SafeSendCheck(ByVal Item As Object) As Boolean
     Dim atts As Collection
     Set atts = GetAttachmentList(Item)
 
-    ' Show confirmation dialog
+    ' --- Try checkbox form first ---
+    Dim formResult As Long   ' 0=not available, 1=send, 2=cancel
+    formResult = TryFormApproach(Item, externals, atts)
+
+    If formResult = 1 Then
+        StampConfirmedFlag Item
+        SafeSendCheck = False
+        Exit Function
+    ElseIf formResult = 2 Then
+        SafeSendCheck = True
+        Exit Function
+    End If
+
+    ' --- Fallback: MsgBox + InputBox ---
     Dim cancelSend As Boolean
     cancelSend = ShowConfirmation(Item, externals, atts)
 
@@ -77,20 +100,109 @@ ErrHandler:
 End Function
 
 ' ---------------------------------------------------------------------------
-'  CONFIRMATION DIALOG (MsgBox with optional InputBox for removal)
+'  CHECKBOX FORM APPROACH
+' ---------------------------------------------------------------------------
+Private Function TryFormApproach(ByVal Item As Object, _
+        ByVal externals As Collection, ByVal atts As Collection) As Long
+    ' Returns: 0=form not available, 1=send approved, 2=cancelled
+    On Error GoTo NoForm
+
+    ' Populate shared data for the form to read
+    SetupSharedData externals, atts, Item.Subject
+
+    ' Show form - this triggers UserForm_Initialize which reads shared data
+    Application.Run "frmSafeSend.ShowSafeSend"
+
+    ' User cancelled?
+    If Not g_SSSendApproved Then
+        TryFormApproach = 2
+        Exit Function
+    End If
+
+    ' Remove unchecked attachments (reverse order!)
+    Dim i As Long
+    For i = g_SSAttCount To 1 Step -1
+        If Not g_SSAttChecked(i) Then
+            Item.Attachments.Remove g_SSAttIndices(i)
+        End If
+    Next i
+
+    ' Remove unchecked recipients (reverse order!)
+    For i = g_SSRecipCount To 1 Step -1
+        If Not g_SSRecipChecked(i) Then
+            Item.Recipients.Remove g_SSRecipIndices(i)
+        End If
+    Next i
+
+    Item.Recipients.ResolveAll
+
+    ' Safety: block send if no recipients remain
+    If Item.Recipients.Count = 0 Then
+        MsgBox "All recipients were removed. Email will not be sent.", _
+               vbInformation, "SafeSend"
+        TryFormApproach = 2
+        Exit Function
+    End If
+
+    TryFormApproach = 1
+    Exit Function
+
+NoForm:
+    TryFormApproach = 0
+End Function
+
+Private Sub SetupSharedData(ByVal externals As Collection, _
+        ByVal atts As Collection, ByVal subj As String)
+
+    Dim i As Long
+    Dim parts() As String
+
+    g_SSSubject = subj
+    g_SSSendApproved = False
+
+    g_SSRecipCount = externals.Count
+    ReDim g_SSRecipients(1 To g_SSRecipCount)
+    ReDim g_SSRecipIndices(1 To g_SSRecipCount)
+    ReDim g_SSRecipChecked(1 To g_SSRecipCount)
+
+    For i = 1 To externals.Count
+        parts = Split(CStr(externals(i)), "|")
+        g_SSRecipients(i) = parts(0) & ":  " & parts(1)
+        g_SSRecipIndices(i) = CLng(parts(2))
+        g_SSRecipChecked(i) = True
+    Next i
+
+    g_SSAttCount = atts.Count
+    If g_SSAttCount > 0 Then
+        ReDim g_SSAttachments(1 To g_SSAttCount)
+        ReDim g_SSAttIndices(1 To g_SSAttCount)
+        ReDim g_SSAttChecked(1 To g_SSAttCount)
+        For i = 1 To atts.Count
+            parts = Split(CStr(atts(i)), "|")
+            If Len(parts(1)) > 0 Then
+                g_SSAttachments(i) = parts(0) & "  (" & parts(1) & ")"
+            Else
+                g_SSAttachments(i) = parts(0)
+            End If
+            g_SSAttIndices(i) = CLng(parts(2))
+            g_SSAttChecked(i) = True
+        Next i
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------
+'  FALLBACK: MsgBox + InputBox (if form not set up)
 ' ---------------------------------------------------------------------------
 Private Function ShowConfirmation(ByVal Item As Object, _
         ByVal externals As Collection, ByVal atts As Collection) As Boolean
-    ' Returns True = cancel send, False = allow send
 
     Dim msg As String
     Dim itemNum As Long
     Dim entry As Variant
     Dim parts() As String
 
-    ' --- Build the numbered list ---
     msg = "Subject: " & Item.Subject & vbCrLf
-    msg = msg & String(50, Chr(8212)) & vbCrLf & vbCrLf
+    msg = msg & String(50, "-") & vbCrLf & vbCrLf
     msg = msg & "EXTERNAL RECIPIENTS:" & vbCrLf & vbCrLf
 
     itemNum = 0
@@ -113,7 +225,7 @@ Private Function ShowConfirmation(ByVal Item As Object, _
         Next entry
     End If
 
-    msg = msg & vbCrLf & String(50, Chr(8212)) & vbCrLf
+    msg = msg & vbCrLf & String(50, "-") & vbCrLf
     msg = msg & "YES = Send to all recipients above" & vbCrLf
     msg = msg & "NO = Choose which to remove first" & vbCrLf
     msg = msg & "CANCEL = Don't send"
@@ -124,28 +236,20 @@ Private Function ShowConfirmation(ByVal Item As Object, _
 
     Select Case result
         Case vbYes
-            ShowConfirmation = False  ' Send all, no changes
-
+            ShowConfirmation = False
         Case vbCancel
-            ShowConfirmation = True   ' Don't send
-
+            ShowConfirmation = True
         Case vbNo
-            ' Let user pick items to remove
             ShowConfirmation = HandleRemoval(Item, externals, atts)
     End Select
 End Function
 
-' ---------------------------------------------------------------------------
-'  REMOVAL DIALOG (InputBox - type numbers to remove)
-' ---------------------------------------------------------------------------
 Private Function HandleRemoval(ByVal Item As Object, _
         ByVal externals As Collection, ByVal atts As Collection) As Boolean
-    ' Returns True = cancel send, False = allow send (with removals applied)
 
     Dim totalItems As Long
     totalItems = externals.Count + atts.Count
 
-    ' --- Build the prompt ---
     Dim prompt As String
     Dim itemNum As Long
     Dim entry As Variant
@@ -174,23 +278,19 @@ Private Function HandleRemoval(ByVal Item As Object, _
         Next entry
     End If
 
-    ' Default "0" = remove nothing; empty string = Cancel clicked
     Dim userInput As String
     userInput = InputBox(prompt, "Remove Items (type numbers)", "0")
 
-    ' Cancel pressed
     If Len(userInput) = 0 Then
         HandleRemoval = True
         Exit Function
     End If
 
-    ' "0" or no valid numbers = send all
     If Trim$(userInput) = "0" Then
         HandleRemoval = False
         Exit Function
     End If
 
-    ' --- Parse the numbers to remove ---
     Dim removeRecip() As Boolean
     Dim removeAtt() As Boolean
     ReDim removeRecip(1 To externals.Count)
@@ -214,7 +314,6 @@ Private Function HandleRemoval(ByVal Item As Object, _
         End If
     Next i
 
-    ' --- Build summary of what will be removed ---
     Dim removedList As String
     For i = 1 To externals.Count
         If removeRecip(i) Then
@@ -231,30 +330,21 @@ Private Function HandleRemoval(ByVal Item As Object, _
         Next i
     End If
 
-    ' Nothing valid entered
     If Len(removedList) = 0 Then
         HandleRemoval = False
         Exit Function
     End If
 
-    ' --- Confirm the removal ---
     Dim confirmMsg As String
     confirmMsg = "The following will be REMOVED before sending:" & vbCrLf & vbCrLf
     confirmMsg = confirmMsg & removedList & vbCrLf
     confirmMsg = confirmMsg & "Proceed?"
 
-    Dim confirmResult As VbMsgBoxResult
-    confirmResult = MsgBox(confirmMsg, vbYesNo + vbQuestion + vbDefaultButton1, _
-                           "Confirm Removal")
-
-    If confirmResult <> vbYes Then
+    If MsgBox(confirmMsg, vbYesNo + vbQuestion, "Confirm Removal") <> vbYes Then
         HandleRemoval = True
         Exit Function
     End If
 
-    ' --- Perform the removals (reverse order!) ---
-
-    ' Remove attachments
     If atts.Count > 0 Then
         For i = atts.Count To 1 Step -1
             If removeAtt(i) Then
@@ -264,7 +354,6 @@ Private Function HandleRemoval(ByVal Item As Object, _
         Next i
     End If
 
-    ' Remove recipients
     For i = externals.Count To 1 Step -1
         If removeRecip(i) Then
             parts = Split(CStr(externals(i)), "|")
@@ -274,10 +363,8 @@ Private Function HandleRemoval(ByVal Item As Object, _
 
     Item.Recipients.ResolveAll
 
-    ' Safety check: any recipients left?
     If Item.Recipients.Count = 0 Then
-        MsgBox "All recipients were removed. Email will not be sent.", _
-               vbInformation, "SafeSend"
+        MsgBox "All recipients removed. Email not sent.", vbInformation, "SafeSend"
         HandleRemoval = True
         Exit Function
     End If

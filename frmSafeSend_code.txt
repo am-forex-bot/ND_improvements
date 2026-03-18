@@ -1,0 +1,205 @@
+'==============================================================================
+' frmSafeSend - Checkbox confirmation form for SafeSend Replacement
+'==============================================================================
+' HOW TO CREATE THIS FORM:
+'
+'   1) In the VBA editor (Alt+F11), right-click your Project > Insert > UserForm
+'   2) In the Properties window (press F4), set:
+'        (Name)    = frmSafeSend
+'        Caption   = Confirm External Send
+'        Width     = 440
+'        Height    = 400
+'        BackColor = &H00FFFFFF&   (white)
+'
+'   3) From the Toolbox (View > Toolbox if not visible), drag these controls
+'      onto the form. The EXACT position doesn't matter - the code repositions
+'      everything at runtime. Just place them roughly in order:
+'
+'      CONTROL TYPE       (Name) PROPERTY        CAPTION / NOTES
+'      ─────────────────  ──────────────────────  ─────────────────────────────
+'      Label              lblSubject              Caption: Subject:
+'                                                 Font: Bold, Size 10
+'
+'      Label              lblRecipHeader          Caption: EXTERNAL RECIPIENTS (untick to remove):
+'                                                 ForeColor: &H000000C8& (red)
+'                                                 Font: Bold, Size 9
+'
+'      CheckBox           chkAllRecip             Caption: Select / Deselect All
+'                                                 Value: True
+'                                                 Font: Bold, Size 9
+'
+'      Label              lblAttHeader            Caption: ATTACHMENTS (untick to remove):
+'                                                 ForeColor: &H00A00000& (dark blue)
+'                                                 Font: Bold, Size 9
+'
+'      CheckBox           chkAllAtt               Caption: Select / Deselect All
+'                                                 Value: True
+'                                                 Font: Bold, Size 9
+'
+'      CommandButton       btnSend                Caption: Send
+'
+'      CommandButton       btnCancel              Caption: Don't Send
+'
+'   4) Double-click the form background to open the code window.
+'      Delete anything already there, and paste ALL the code below.
+'
+'   5) IMPORTANT: The (Name) property of each control MUST match exactly.
+'      If btnSend is named CommandButton1, the click event won't fire!
+'
+'==============================================================================
+' >>>  PASTE EVERYTHING BELOW THIS LINE INTO THE FORM CODE WINDOW  <<<
+'==============================================================================
+Option Explicit
+
+' --- Entry point called by SafeSendReplacement via Application.Run ---
+Public Sub ShowSafeSend()
+    Me.Show vbModal
+End Sub
+
+' --- Build the form dynamically based on shared data ---
+Private Sub UserForm_Initialize()
+    Dim yPos As Single
+    Dim i As Long
+    Dim ctl As Object
+
+    Me.BackColor = RGB(255, 255, 255)
+    Me.Width = 440
+
+    ' Subject
+    Me.lblSubject.Left = 12
+    Me.lblSubject.Top = 8
+    Me.lblSubject.Width = 410
+    Me.lblSubject.Height = 20
+    Me.lblSubject.BackColor = Me.BackColor
+    Me.lblSubject.Caption = "Subject: " & SafeSendReplacement.g_SSSubject
+
+    yPos = 34
+
+    ' Recipients header
+    Me.lblRecipHeader.Left = 12
+    Me.lblRecipHeader.Top = yPos
+    Me.lblRecipHeader.Width = 410
+    Me.lblRecipHeader.BackColor = Me.BackColor
+    yPos = yPos + 18
+
+    ' Select All Recipients
+    Me.chkAllRecip.Left = 20
+    Me.chkAllRecip.Top = yPos
+    Me.chkAllRecip.Width = 400
+    Me.chkAllRecip.BackColor = Me.BackColor
+    Me.chkAllRecip.Value = True
+    yPos = yPos + 22
+
+    ' Dynamic recipient checkboxes
+    For i = 1 To SafeSendReplacement.g_SSRecipCount
+        Set ctl = Me.Controls.Add("Forms.CheckBox.1", "chkRecip" & i)
+        ctl.Left = 28
+        ctl.Top = yPos
+        ctl.Width = 396
+        ctl.Height = 18
+        ctl.Caption = SafeSendReplacement.g_SSRecipients(i)
+        ctl.Value = True
+        ctl.BackColor = Me.BackColor
+        yPos = yPos + 20
+    Next i
+
+    yPos = yPos + 12
+
+    ' Attachments section (hidden if none)
+    If SafeSendReplacement.g_SSAttCount > 0 Then
+        Me.lblAttHeader.Visible = True
+        Me.lblAttHeader.Left = 12
+        Me.lblAttHeader.Top = yPos
+        Me.lblAttHeader.Width = 410
+        Me.lblAttHeader.BackColor = Me.BackColor
+        yPos = yPos + 18
+
+        Me.chkAllAtt.Visible = True
+        Me.chkAllAtt.Left = 20
+        Me.chkAllAtt.Top = yPos
+        Me.chkAllAtt.Width = 400
+        Me.chkAllAtt.BackColor = Me.BackColor
+        Me.chkAllAtt.Value = True
+        yPos = yPos + 22
+
+        For i = 1 To SafeSendReplacement.g_SSAttCount
+            Set ctl = Me.Controls.Add("Forms.CheckBox.1", "chkAtt" & i)
+            ctl.Left = 28
+            ctl.Top = yPos
+            ctl.Width = 396
+            ctl.Height = 18
+            ctl.Caption = SafeSendReplacement.g_SSAttachments(i)
+            ctl.Value = True
+            ctl.BackColor = Me.BackColor
+            yPos = yPos + 20
+        Next i
+    Else
+        Me.lblAttHeader.Visible = False
+        Me.chkAllAtt.Visible = False
+    End If
+
+    ' Position buttons at the bottom
+    yPos = yPos + 16
+    Me.btnSend.Left = 240
+    Me.btnSend.Top = yPos
+    Me.btnSend.Width = 88
+    Me.btnSend.Height = 28
+    Me.btnCancel.Left = 336
+    Me.btnCancel.Top = yPos
+    Me.btnCancel.Width = 88
+    Me.btnCancel.Height = 28
+
+    ' Resize form to fit content
+    Dim totalH As Single
+    totalH = yPos + Me.btnSend.Height + 50
+    If totalH < 220 Then totalH = 220
+    If totalH > 550 Then
+        Me.ScrollBars = 2   ' fmScrollBarsVertical
+        Me.ScrollHeight = totalH
+        totalH = 550
+    End If
+    Me.Height = totalH
+End Sub
+
+' --- Send button: read checkbox states and close ---
+Private Sub btnSend_Click()
+    Dim i As Long
+    For i = 1 To SafeSendReplacement.g_SSRecipCount
+        SafeSendReplacement.g_SSRecipChecked(i) = CBool(Me.Controls("chkRecip" & i).Value)
+    Next i
+    For i = 1 To SafeSendReplacement.g_SSAttCount
+        SafeSendReplacement.g_SSAttChecked(i) = CBool(Me.Controls("chkAtt" & i).Value)
+    Next i
+    SafeSendReplacement.g_SSSendApproved = True
+    Unload Me
+End Sub
+
+' --- Don't Send button ---
+Private Sub btnCancel_Click()
+    SafeSendReplacement.g_SSSendApproved = False
+    Unload Me
+End Sub
+
+' --- X button = cancel ---
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    If CloseMode = 0 Then
+        SafeSendReplacement.g_SSSendApproved = False
+    End If
+End Sub
+
+' --- Select / Deselect All Recipients ---
+Private Sub chkAllRecip_Click()
+    Dim i As Long
+    For i = 1 To SafeSendReplacement.g_SSRecipCount
+        Me.Controls("chkRecip" & i).Value = Me.chkAllRecip.Value
+    Next i
+End Sub
+
+' --- Select / Deselect All Attachments ---
+Private Sub chkAllAtt_Click()
+    If SafeSendReplacement.g_SSAttCount = 0 Then Exit Sub
+    Dim i As Long
+    For i = 1 To SafeSendReplacement.g_SSAttCount
+        Me.Controls("chkAtt" & i).Value = Me.chkAllAtt.Value
+    Next i
+End Sub
