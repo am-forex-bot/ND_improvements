@@ -111,7 +111,10 @@ Private Function TryFormApproach(ByVal Item As Object, _
     SetupSharedData externals, atts, Item.Subject
 
     ' Show form - this triggers UserForm_Initialize which reads shared data
-    Application.Run "frmSafeSend.ShowSafeSend"
+    Dim frm As frmSafeSend
+    Set frm = New frmSafeSend
+    frm.Show vbModal
+    Set frm = Nothing
 
     ' User cancelled?
     If Not g_SSSendApproved Then

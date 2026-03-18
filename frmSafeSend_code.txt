@@ -51,11 +51,6 @@
 '==============================================================================
 Option Explicit
 
-' --- Entry point called by SafeSendReplacement via Application.Run ---
-Public Sub ShowSafeSend()
-    Me.Show vbModal
-End Sub
-
 ' --- Build the form dynamically based on shared data ---
 Private Sub UserForm_Initialize()
     Dim yPos As Single
