@@ -25,15 +25,15 @@
 '                                                 Font: Bold, Size 9
 '
 '      CheckBox           chkAllRecip             Caption: Select / Deselect All
-'                                                 Value: True
+'                                                 Value: False
 '                                                 Font: Bold, Size 9
 '
-'      Label              lblAttHeader            Caption: ATTACHMENTS (untick to remove):
+'      Label              lblAttHeader            Caption: ATTACHMENTS (tick to include):
 '                                                 ForeColor: &H00A00000& (dark blue)
 '                                                 Font: Bold, Size 9
 '
 '      CheckBox           chkAllAtt               Caption: Select / Deselect All
-'                                                 Value: True
+'                                                 Value: False
 '                                                 Font: Bold, Size 9
 '
 '      CommandButton       btnSend                Caption: Send
@@ -87,10 +87,10 @@ Private Sub UserForm_Initialize()
     Me.chkAllRecip.Top = yPos
     Me.chkAllRecip.Width = 400
     Me.chkAllRecip.BackColor = Me.BackColor
-    Me.chkAllRecip.Value = True
+    Me.chkAllRecip.Value = False
     yPos = yPos + 22
 
-    ' Dynamic recipient checkboxes
+    ' Dynamic recipient checkboxes (unchecked - user must tick to confirm)
     For i = 1 To SafeSendReplacement.g_SSRecipCount
         Set ctl = Me.Controls.Add("Forms.CheckBox.1", "chkRecip" & i)
         ctl.Left = 28
@@ -98,7 +98,7 @@ Private Sub UserForm_Initialize()
         ctl.Width = 396
         ctl.Height = 18
         ctl.Caption = SafeSendReplacement.g_SSRecipients(i)
-        ctl.Value = True
+        ctl.Value = False
         ctl.BackColor = Me.BackColor
         yPos = yPos + 20
     Next i
@@ -119,7 +119,7 @@ Private Sub UserForm_Initialize()
         Me.chkAllAtt.Top = yPos
         Me.chkAllAtt.Width = 400
         Me.chkAllAtt.BackColor = Me.BackColor
-        Me.chkAllAtt.Value = True
+        Me.chkAllAtt.Value = False
         yPos = yPos + 22
 
         For i = 1 To SafeSendReplacement.g_SSAttCount
@@ -129,7 +129,7 @@ Private Sub UserForm_Initialize()
             ctl.Width = 396
             ctl.Height = 18
             ctl.Caption = SafeSendReplacement.g_SSAttachments(i)
-            ctl.Value = True
+            ctl.Value = False
             ctl.BackColor = Me.BackColor
             yPos = yPos + 20
         Next i

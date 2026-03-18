@@ -169,7 +169,7 @@ Private Sub SetupSharedData(ByVal externals As Collection, _
         parts = Split(CStr(externals(i)), "|")
         g_SSRecipients(i) = parts(0) & ":  " & parts(1)
         g_SSRecipIndices(i) = CLng(parts(2))
-        g_SSRecipChecked(i) = True
+        g_SSRecipChecked(i) = False
     Next i
 
     g_SSAttCount = atts.Count
@@ -185,7 +185,7 @@ Private Sub SetupSharedData(ByVal externals As Collection, _
                 g_SSAttachments(i) = parts(0)
             End If
             g_SSAttIndices(i) = CLng(parts(2))
-            g_SSAttChecked(i) = True
+            g_SSAttChecked(i) = False
         Next i
     End If
 End Sub
