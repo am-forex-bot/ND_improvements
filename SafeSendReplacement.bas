@@ -32,6 +32,12 @@ Private Const CHECK_BCC As Boolean = True
 Private Const CONFIRMED_FLAG As String = "_SafeSendConfirmed"
 
 ' ---------------------------------------------------------------------------
+'  IN-MEMORY CONFIRMED TRACKING (avoids Item.Save during ItemSend)
+' ---------------------------------------------------------------------------
+Private m_confirmedEntryId As String   ' EntryID of last confirmed item
+Private m_confirmedTime As Date        ' when it was confirmed (auto-expires)
+
+' ---------------------------------------------------------------------------
 '  SHARED DATA (read/written by frmSafeSend)
 ' ---------------------------------------------------------------------------
 Public g_SSSubject As String
@@ -55,8 +61,9 @@ Public Function SafeSendCheck(ByVal Item As Object) As Boolean
     If TypeName(Item) <> "MailItem" Then Exit Function
 
     ' Already confirmed this draft? Let it through.
+    ' Don't clear the flag yet - another add-in (e.g. NetDocuments) may
+    ' cancel and re-trigger the send. The flag auto-expires after 60 seconds.
     If HasBeenConfirmed(Item) Then
-        ClearConfirmedFlag Item
         Exit Function
     End If
 
@@ -520,18 +527,42 @@ End Function
 
 ' ---------------------------------------------------------------------------
 '  CONFIRMED FLAG (prevents double-prompting)
+'  Uses in-memory variables instead of Item.Save, which doesn't work
+'  reliably during the ItemSend event. Auto-expires after 60 seconds
+'  so stale approvals don't leak across different emails.
 ' ---------------------------------------------------------------------------
 Private Function HasBeenConfirmed(ByVal Item As Object) As Boolean
     On Error Resume Next
+    HasBeenConfirmed = False
+
+    ' Check in-memory flag first (works even when Item.Save fails)
+    If Len(m_confirmedEntryId) > 0 Then
+        ' Auto-expire after 60 seconds
+        If DateDiff("s", m_confirmedTime, Now) < 60 Then
+            If Item.EntryID = m_confirmedEntryId Then
+                HasBeenConfirmed = True
+                Exit Function
+            End If
+        Else
+            ' Expired - clear it
+            m_confirmedEntryId = ""
+        End If
+    End If
+
+    ' Fallback: also check UserProperty (in case item was saved outside ItemSend)
     Dim prop As Object
     Set prop = Item.UserProperties.Find(CONFIRMED_FLAG)
-    HasBeenConfirmed = (Not prop Is Nothing)
-    If HasBeenConfirmed Then HasBeenConfirmed = (prop.Value = True)
+    If Not prop Is Nothing Then HasBeenConfirmed = (prop.Value = True)
     On Error GoTo 0
 End Function
 
 Private Sub StampConfirmedFlag(ByVal Item As Object)
     On Error Resume Next
+    ' Primary: in-memory flag (always works during ItemSend)
+    m_confirmedEntryId = Item.EntryID
+    m_confirmedTime = Now
+
+    ' Secondary: also try UserProperty (may or may not persist)
     Dim prop As Object
     Set prop = Item.UserProperties.Add(CONFIRMED_FLAG, 6, False)
     prop.Value = True
@@ -541,6 +572,10 @@ End Sub
 
 Private Sub ClearConfirmedFlag(ByVal Item As Object)
     On Error Resume Next
+    ' Clear in-memory flag
+    m_confirmedEntryId = ""
+
+    ' Clear UserProperty too
     Dim prop As Object
     Set prop = Item.UserProperties.Find(CONFIRMED_FLAG)
     If Not prop Is Nothing Then prop.Delete
