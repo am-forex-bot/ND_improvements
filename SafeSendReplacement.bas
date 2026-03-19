@@ -1,4 +1,3 @@
-Attribute VB_Name = "SafeSendReplacement"
 '==============================================================================
 ' SafeSend Replacement - External Recipient Confirmation for Outlook
 '==============================================================================
